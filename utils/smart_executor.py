@@ -3,12 +3,19 @@ from pathlib import Path
 logger=logging.getLogger("EnterpriseAgent")
 class SmartCommandExecutor:
     def __init__(self,timeout_minutes=20,poll_interval=30):self.timeout_minutes=timeout_minutes;self.poll_interval=poll_interval
-    def execute_with_polling(self,command):
+    def execute_with_polling(self,command,cwd=None):
         start=time.monotonic(); limit=self.timeout_minutes*60
+        if cwd:
+            try: Path(cwd).mkdir(parents=True,exist_ok=True)
+            except OSError as e: logger.warning("[executor] cwd unavailable (%s): %s",cwd,e); cwd=None
         with tempfile.TemporaryDirectory(prefix="enterprise-agent-") as d:
             out,err=Path(d)/"stdout.log",Path(d)/"stderr.log"
             with out.open("w+",encoding="utf-8") as so,err.open("w+",encoding="utf-8") as se:
-                kw={"shell":True,"stdout":so,"stderr":se,"text":True}
+                # stdin=DEVNULL: any tool that would otherwise block on a
+                # password/confirmation prompt gets EOF and fails fast instead
+                # of hanging until the command timeout.
+                kw={"shell":True,"stdin":subprocess.DEVNULL,"stdout":so,"stderr":se,"text":True}
+                if cwd:kw["cwd"]=cwd
                 if os.name=="posix":kw["start_new_session"]=True
                 p=subprocess.Popen(command,**kw)
                 while p.poll() is None:

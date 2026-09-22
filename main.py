@@ -1,6 +1,6 @@
-import hashlib, json, logging, os, re, shlex, sys, time
+import hashlib, json, logging, os, re, shlex, shutil, sys, time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from core.reasoning import ReasoningState
 from core.action_policy import ActionPolicy
 from core.world_model import WorldModel
@@ -16,12 +16,58 @@ MAX_NO_PROGRESS_STREAK=int(os.getenv("AGENT_MAX_NO_PROGRESS","25"))
 MAX_PLANNER_RETRIES=int(os.getenv("AGENT_MAX_PLANNER_RETRIES","3"))
 ARTIFACT_EXTENSIONS={".xml",".txt",".json",".ini",".conf",".config",".yaml",".yml",".log"}
 
+# --- Flag recognition -------------------------------------------------------
+# HTB flags are bare 32-hex tokens (no flag{}/htb{} wrapper). A naive 32-hex
+# scan over all stdout would collide with NTLM hashes and Kerberos TGS blobs,
+# so hex detection in command output is deliberately bound to a flag-file
+# context (the command must reference user.txt/root.txt/proof.txt/flag.txt).
+FLAG_FILE_NAMES={"user.txt","root.txt","proof.txt","flag.txt","flags.json","user.flag","root.flag"}
+FLAG_BRACE=re.compile(r"(?:flag|htb)\{[^}]{4,400}\}",re.I)
+FLAG_HEX32=re.compile(r"\b[a-f0-9]{32}\b",re.I)
+FLAG_FILE_REF=re.compile(r"\b(?:user|root|proof|flag)\.txt\b",re.I)
+
+# --- Environment preflight --------------------------------------------------
+# Advisory (non-fatal) presence checks for the toolchain an AD assessment
+# typically needs. Missing tools are logged so a run that later fails on a
+# missing binary is diagnosable up front rather than as an opaque returncode.
+REQUIRED_TOOLS=("nmap","smbclient","ldapsearch")
+OPTIONAL_TOOLS=("nxc","netexec","crackmapexec","rpcclient","enum4linux","kerbrute",
+                "gpp-decrypt","hashcat","john","impacket-GetUserSPNs","GetUserSPNs.py",
+                "impacket-wmiexec","wmiexec.py","evil-winrm")
+DEFAULT_WORDLIST=os.getenv("AGENT_WORDLIST","/usr/share/wordlists/rockyou.txt")
+
+
+def preflight_dependencies() -> Dict[str, List[str]]:
+    """Report which expected tools/wordlists are resolvable on PATH.
+
+    Never fatal: the planner is free to use whatever is installed, and the
+    operator may run a subset of the chain.
+    """
+    missing_required=[t for t in REQUIRED_TOOLS if not shutil.which(t)]
+    missing_optional=[t for t in OPTIONAL_TOOLS if not shutil.which(t)]
+    wordlist_ok=Path(DEFAULT_WORDLIST).is_file()
+    if missing_required:
+        logger.warning("[preflight] Missing REQUIRED tools: %s", ", ".join(missing_required))
+    if missing_optional:
+        logger.info("[preflight] Optional tools not found (chain may be limited): %s", ", ".join(missing_optional))
+    if not wordlist_ok:
+        logger.warning("[preflight] Wordlist not found at %s (set AGENT_WORDLIST)", DEFAULT_WORDLIST)
+    else:
+        logger.info("[preflight] Wordlist available: %s", DEFAULT_WORDLIST)
+    return {"missing_required":missing_required,"missing_optional":missing_optional,
+            "wordlist_ok":[DEFAULT_WORDLIST] if wordlist_ok else []}
+
 class EnterpriseDynamicAgent:
     """Single autonomous runtime. No target-specific attack path lives here."""
     def __init__(self,target:str,domain_name:Optional[str]=None):
         if not evaluate_policy(target):
             raise PermissionError(f"Target '{target}' is outside the authorized scope. Aborting before any command runs.")
         self.target=target; self.domain_name=domain_name; self.state_manager=StateManager(target)
+        # Absolute anchors so child-process cwd can be pinned to loot/ (Patch 2)
+        # without breaking the agent's own state/scan bookkeeping.
+        self.target_root=Path(f"testing/{target}").resolve()
+        self.scans_dir=self.target_root/"scans"; self.loot_dir=self.target_root/"loot"
+        self.loot_dir.mkdir(parents=True,exist_ok=True); self.scans_dir.mkdir(parents=True,exist_ok=True)
         state=self.state_manager.load_state(); self.current_step=int(state.get("step_count",0))+1
         self.executor=SmartCommandExecutor(timeout_minutes=int(os.getenv("AGENT_COMMAND_TIMEOUT_MINUTES","20")),poll_interval=int(os.getenv("AGENT_POLL_INTERVAL","15")))
         self.planner=LLMDecisionEngine(); self.reasoning=ReasoningState(state)
@@ -30,25 +76,63 @@ class EnterpriseDynamicAgent:
     def _digest(value): return hashlib.sha256(value.encode("utf-8",errors="ignore")).hexdigest()[:16]
     @staticmethod
     def _norm(value): return re.sub(r"\s+"," ",str(value or "").strip())
-    def scan_path(self): return Path(f"testing/{self.target}/scans/recon.txt")
+    def scan_path(self): return self.scans_dir/"recon.txt"
 
-    def flags_found(self):
-        root=Path(f"testing/{self.target}")
-        if not root.exists(): return []
-        marker=re.compile(r"(?:flag|htb)\{[^}]{4,400}\}",re.I); names={"user.txt","root.txt","proof.txt","flag.txt","flags.json","user.flag","root.flag"}; found=[]
-        for p in root.rglob("*"):
+    @staticmethod
+    def _extract_flag_token(text: str) -> Optional[str]:
+        """Return a normalized flag token from text, brace form first."""
+        m=FLAG_BRACE.search(text or "")
+        if m: return m.group(0)
+        m=FLAG_HEX32.search(text or "")
+        return m.group(0) if m else None
+
+    def _flags_from_filesystem(self) -> List[str]:
+        found=[]
+        if not self.target_root.exists(): return found
+        for p in self.target_root.rglob("*"):
             if not p.is_file(): continue
-            if p.name.lower() in names: found.append(str(p)); continue
             try:
-                if p.stat().st_size<=2_000_000 and marker.search(p.read_text(encoding="utf-8",errors="ignore")): found.append(str(p))
-            except (OSError,UnicodeError): pass
+                if p.stat().st_size>2_000_000: continue
+                content=p.read_text(encoding="utf-8",errors="ignore")
+            except (OSError,UnicodeError): continue
+            token=self._extract_flag_token(content)
+            # HTB flag files hold exactly one 32-hex line; accept that shape too.
+            stripped=content.strip()
+            if p.name.lower() in FLAG_FILE_NAMES and (token or FLAG_HEX32.fullmatch(stripped)):
+                found.append(f"{p}::{token or stripped}"); continue
+            if FLAG_BRACE.search(content):
+                found.append(f"{p}::{token}"); continue
+            if FLAG_HEX32.fullmatch(stripped):  # a file whose whole body is a flag
+                found.append(f"{p}::{stripped}")
+        return found
+
+    def _flags_from_history(self, state: Dict[str, Any]) -> List[str]:
+        """Detect flags printed to stdout. Bare 32-hex is only trusted when the
+        producing command referenced a flag file, which avoids treating NTLM
+        hashes / Kerberos TGS material as flags."""
+        found=[]
+        for h in state.get("history",[]):
+            if h.get("event_type")!="action": continue
+            out=str(h.get("output","")); cmd=str(h.get("command",""))
+            brace=FLAG_BRACE.search(out)
+            if brace:
+                found.append(f"stdout(step {h.get('step')})::{brace.group(0)}"); continue
+            if FLAG_FILE_REF.search(cmd):
+                hexm=FLAG_HEX32.search(out)
+                if hexm:
+                    found.append(f"stdout(step {h.get('step')})::{hexm.group(0)}")
+        return found
+
+    def flags_found(self, state: Optional[Dict[str, Any]]=None) -> List[str]:
+        found=list(self._flags_from_filesystem())
+        if state is not None:
+            found.extend(self._flags_from_history(state))
         return sorted(set(found))
 
     def _artifacts(self):
-        loot=Path(f"testing/{self.target}/loot")
-        if not loot.exists(): return []
+        if not self.loot_dir.exists(): return []
         out=[]
-        for p in loot.rglob("*"):
+        for p in self.loot_dir.rglob("*"):
             if p.is_file() and p.name!="potential_exploits.json" and p.suffix.lower() in ARTIFACT_EXTENSIONS:
                 try:
                     if p.stat().st_size<=2_000_000: out.append(p)
@@ -56,10 +140,18 @@ class EnterpriseDynamicAgent:
         return out
 
     def _next_artifact(self,state):
-        inspected={self._norm(h.get("resource")) for h in state.get("history",[]) if h.get("event_type")=="action" and h.get("action_class")=="inspect_artifact"}
-        candidates=[p for p in self._artifacts() if self._norm(os.path.relpath(p,Path.cwd())) not in inspected and self._norm(str(p)) not in inspected]
+        inspected=set()
+        for h in state.get("history",[]):
+            if h.get("event_type")=="action" and h.get("action_class")=="inspect_artifact":
+                inspected.add(self._norm(h.get("resource")))
+        candidates=[]
+        for p in self._artifacts():
+            keys={self._norm(str(p)),self._norm(os.path.relpath(p,self.loot_dir))}
+            try: keys.add(self._norm(os.path.relpath(p,Path.cwd())))
+            except ValueError: pass
+            if not (keys & inspected): candidates.append(p)
         if not candidates: return None
-        p=max(candidates,key=lambda x:(x.stat().st_mtime,x.stat().st_size)); resource=os.path.relpath(p,Path.cwd())
+        p=max(candidates,key=lambda x:(x.stat().st_mtime,x.stat().st_size)); resource=str(p)
         return {"action_class":"inspect_artifact","goal_id":"inspect_new_evidence","hypothesis_id":"","evidence_question":"What security-relevant facts and capabilities does this newly acquired artifact provide?","resource":resource,"command":f"sed -n '1,240p' {shlex.quote(resource)}","mission_complete":False}
 
     def _world(self,state):
@@ -117,7 +209,14 @@ class EnterpriseDynamicAgent:
             "recent_ldap_actions": len(ldap_actions),
             "recent_ldap_low_information": ldap_low_info
         }
-        return {"world":world,"recent_actions":recent,"selection_constraints":constraints,"mission":{"complete":bool(state.get("mission_complete")),"progress_streak":int((state.get("planner_state") or {}).get("no_progress_streak",0))}}
+        workspace={
+            "cwd_note":"Commands run with their working directory set to the loot directory below. Write downloads and tool artifacts using RELATIVE filenames; they are persisted and auto-inspected next iteration.",
+            "loot_dir":str(self.loot_dir),
+            "scans_dir":str(self.scans_dir),
+            "wordlist":DEFAULT_WORDLIST,
+            "execution_note":"Execution is strictly non-interactive (stdin is closed). Always pass explicit auth flags (e.g. -N / --no-pass / user:pass@host); never rely on a password prompt.",
+        }
+        return {"world":world,"recent_actions":recent,"selection_constraints":constraints,"workspace":workspace,"mission":{"complete":bool(state.get("mission_complete")),"progress_streak":int((state.get("planner_state") or {}).get("no_progress_streak",0))}}
     def _block(self,state,reason,decision=None):
         decision=decision or {}
         logger.warning("[!] Planner rejection: %s | action_class=%s | resource=%s | command=%s", reason, decision.get("action_class",""), decision.get("resource",""), decision.get("command",""))
@@ -219,7 +318,11 @@ class EnterpriseDynamicAgent:
             self._block(state,"no_evidence_grounded_candidate",{"candidate_count":len(candidates)})
         return None
     def _execute(self,state,d):
-        before=self._world(state); started=time.monotonic(); r=self.executor.execute_with_polling(d["command"]); execution_ms=round((time.monotonic()-started)*1000); output=r.get("stdout","")
+        # Patch 3: guarantee non-interactive execution. Child cwd is pinned to
+        # loot/ (Patch 2) so any relative output file the tool writes is
+        # captured and auto-inspected on the next iteration.
+        d["command"]=CommandSanitizer.ensure_noninteractive(d["command"])
+        before=self._world(state); started=time.monotonic(); r=self.executor.execute_with_polling(d["command"],cwd=str(self.loot_dir)); execution_ms=round((time.monotonic()-started)*1000); output=r.get("stdout","")
         if r.get("stderr"): output+="\nSTDERR:\n"+r["stderr"]
         provisional={"event_type":"action","step":self.current_step,"evidence_question_key":d.get("evidence_question_key") or ActionPolicy.question_key(d),"command_key":d.get("command_key") or ActionPolicy.command_key(d["command"]),"action_class":d.get("action_class","unspecified"),"goal_id":d.get("goal_id",""),"hypothesis_id":d.get("hypothesis_id",""),"evidence_question":d.get("evidence_question",""),"resource":d.get("resource",""),"command":d["command"],"output":output[:8000],"returncode":r.get("returncode"),"status":r.get("status"),"planner_latency_ms":d.get("_planner_latency_ms"),"execution_latency_ms":execution_ms}
         after_reasoning=self.reasoning.update(output,state.get("history",[])+[provisional],d.get("command", ""))
@@ -234,23 +337,32 @@ class EnterpriseDynamicAgent:
         logger.info("[=] Evidence | exec=%sms | rc=%s | facts+%s | capabilities+%s | hypothesis_delta=%s | progress=%s | digest=%s", execution_ms, r.get("returncode"), delta["fact_delta"], delta["capability_delta"], delta["hypothesis_confidence_delta"], progress, delta["output_digest"])
         return provisional
 
+    def _complete_if_flag(self,state) -> bool:
+        flags=self.flags_found(state)
+        if flags:
+            self.state_manager.mark_complete(f"flag_found:{flags[0]}",self.current_step)
+            logger.info("[+] Flag evidence detected: %s", flags[0])
+            return True
+        return False
+
     def run_autonomous_loop(self):
+        preflight_dependencies()
         while MAX_STEPS is None or self.current_step<=MAX_STEPS:
             state=self.state_manager.load_state()
             if state.get("mission_complete"): return
-            flags=self.flags_found()
-            if flags: self.state_manager.mark_complete(f"flag_found:{flags[0]}",self.current_step); logger.info("[+] Flag evidence detected."); return
+            if self._complete_if_flag(state): return
             d=self._next_artifact(state) or self._initial() or self._plan(state)
             if d is None: logger.error("[!] No valid action; stopping safely."); self._block(state,"no_valid_action"); return
             if d.get("mission_complete"):
-                if self.flags_found(): self.state_manager.mark_complete("flag_found",self.current_step)
-                return
+                if self._complete_if_flag(state): return
             logger.info("[*] Paso %d/%s | %s | %s",self.current_step,MAX_STEPS or "∞",d.get("action_class","action"),d["command"])
             if not CommandSanitizer.validate_command_safety(d["command"]): self._block(state,"execution_policy_rejected",d); return
             entry=self._execute(state,d); ps=dict(state.get("planner_state") or {}); streak=int(ps.get("no_progress_streak",0)); streak=streak+1 if entry.get("no_new_evidence") else 0
             ps.update({"status":"NO_PROGRESS" if entry.get("no_new_evidence") else "PROGRESS","no_progress_streak":streak,"last_reason":"no_new_evidence" if entry.get("no_new_evidence") else "new_evidence"})
             reasoning=self.reasoning.update(entry.get("output",""),state.get("history",[])+[entry],entry.get("command", ""))
             self.state_manager.save_state(self.current_step,entry,phase=entry.get("action_class","autonomous"),mission_complete=False,extra={"planner_state":ps,"reasoning":reasoning,"last_action":{k:entry.get(k) for k in ("action_class","goal_id","hypothesis_id","evidence_question","resource")}})
+            # Declare victory in the same iteration the flag was read to stdout.
+            if self._complete_if_flag(self.state_manager.load_state()): return
             if streak>=MAX_NO_PROGRESS_STREAK: logger.error("[!] Progress budget exhausted; stopping safely."); return
             self.current_step+=1; time.sleep(1)
 

@@ -164,6 +164,8 @@ class EnterpriseDynamicAgent:
         if action=="recon":
             output=run_recon(self.target,self.workdir/"scans"/"full_recon.txt")
             state["recon_complete"]=bool(output)
+            if output.startswith("ERROR:") or "Salida con código" in output:
+                failure=self.register_failure(state,action,output)
             state["discovered_services"]=[
                 line for line in output.splitlines() if "/tcp" in line and "open" in line
             ]
@@ -177,7 +179,10 @@ class EnterpriseDynamicAgent:
         elif action=="vulnerability_scan":
             output=run_vulnerability_scan(self.target,self.workdir/"scans"/"vulnerability_scan.txt")
             state["vulnerability_scan_complete"]=bool(output)
-            self.build_potential_exploits(state)
+            if output.startswith("ERROR:") or "Salida con código" in output:
+                failure=self.register_failure(state,action,output)
+            else:
+                self.build_potential_exploits(state)
 
         elif action=="run_kali_tool":
             tool=decision.get("tool_name")
@@ -185,7 +190,11 @@ class EnterpriseDynamicAgent:
             allowed={x.get("name") for x in state.get("kali_tools",[]) if x.get("name")}
             if tool not in allowed:
                 return state,{"event_type":"blocked","action":action,"reason":"tool_not_in_discovered_kali_catalog"}
-            output=run_shell_tool(tool,args,timeout=int(decision.get("timeout",900)),catalogued_tools=allowed)
+            try:
+                output=run_shell_tool(tool,args,timeout=int(decision.get("timeout",900)),catalogued_tools=allowed)
+            except Exception as exc:
+                output=f"ERROR: {exc}"
+                failure=self.register_failure(state,action,output)
 
         elif action=="cve_lookup":
             c=self.candidate(state,cid)
@@ -282,9 +291,11 @@ class EnterpriseDynamicAgent:
             analysis=self.engine.analyze_privesc(pending,state)
             selected=analysis.get("validated_id")
             for h in state["privesc_candidates"]:
+                h.pop("selected_by_reasoner",None)
                 if h.get("id")==selected:
-                    h["status"]="validated"
-                    h["validation"]=analysis
+                    h["status"]="analyzed"
+                    h["selected_by_reasoner"]=True
+                    h["reasoning"]=analysis
                 elif h.get("status")=="discovered":
                     h["status"]="analyzed"
             output=json.dumps(analysis,ensure_ascii=False)
@@ -293,7 +304,7 @@ class EnterpriseDynamicAgent:
             selected=[h for h in state.get("privesc_candidates",[]) if h.get("status")=="analyzed"]
             if not selected:
                 return state,{"event_type":"blocked","action":action,"reason":"no_analyzed_privesc_hypothesis"}
-            hypothesis=selected[0]
+            hypothesis=next((h for h in selected if h.get("selected_by_reasoner")),selected[0])
             output=run_privilege_validation(self.target,hypothesis)
             valid="VALIDATED" in output.upper() or "VULNERABILITY_CONFIRMED" in output.upper()
             if valid:

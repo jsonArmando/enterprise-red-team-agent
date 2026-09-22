@@ -2,7 +2,7 @@ import logging
 from langgraph.graph import StateGraph,END
 from nodes.dynamic_agent import dynamic_redteam_node
 logger=logging.getLogger("GraphBuilder")
-MAX_STEPS=15
+MAX_STEPS=200
 def should_continue(state):
     if state.get("mission_complete",False):return "end"
     if int(state.get("step_count",0))>=MAX_STEPS:return "end"

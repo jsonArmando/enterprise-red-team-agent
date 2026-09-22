@@ -36,10 +36,11 @@ class StateManager:
             try:
                 d=redact_secrets(json.loads(self.state_file.read_text(encoding="utf-8")))
                 d.setdefault("history",[]); d.setdefault("completed_actions",[]); d.setdefault("action_attempts",{}); d.setdefault("mission_complete",False)
+                d.setdefault("reasoning",{"facts":[],"new_facts":[],"capabilities":[],"hypotheses":[],"candidate_goals":[]})
                 d.setdefault("planner_state",{"status":"READY","stalled_attempts":0,"blocked_goals":[],"blocked_actions":[],"recovery_attempts":[],"last_reason":"","no_progress_streak":0})
                 return d
             except Exception as e:logger.error("[-] state read: %s",e)
-        return {"target":self.target_ip,"phase":"recon","step_count":0,"mission_complete":False,"last_output":"","history":[],"discovered_services":[],"vulnerabilities":[],"credentials":[],"completed_actions":[],"action_attempts":{},"planner_state":{"status":"READY","stalled_attempts":0,"blocked_goals":[],"blocked_actions":[],"recovery_attempts":[],"last_reason":"","no_progress_streak":0}}
+        return {"target":self.target_ip,"phase":"recon","step_count":0,"mission_complete":False,"last_output":"","history":[],"discovered_services":[],"vulnerabilities":[],"credentials":[],"completed_actions":[],"action_attempts":{},"reasoning":{"facts":[],"new_facts":[],"capabilities":[],"hypotheses":[],"candidate_goals":[]},"planner_state":{"status":"READY","stalled_attempts":0,"blocked_goals":[],"blocked_actions":[],"recovery_attempts":[],"last_reason":"","no_progress_streak":0}}
 def get_target_dir(target):
     p=Path(f"testing/{target}"); p.mkdir(parents=True,exist_ok=True); (p/"scans").mkdir(exist_ok=True); (p/"loot").mkdir(exist_ok=True); return str(p)
 def save_persistent_state(state):

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
-import os
 import re
 import sys
 import time
@@ -41,9 +41,13 @@ def parse_args():
 
 
 def inject_domain(domain: str | None, command: str) -> str:
-    if domain:
-        return command.replace("detected.htb", domain)
-    return command.replace(" -d detected.htb", "").replace("detected.htb/", "/")
+    if not domain:
+        return command.replace(" -d detected.htb", "").replace("detected.htb/", "/")
+    parts = domain.split(".")
+    dc = ",".join(f"DC={p}" for p in parts)
+    return (
+        command.replace("detected.htb", domain).replace("DC=detected,DC=htb", dc)
+    )
 
 
 def write_flags(loot: Path, status: dict) -> None:
@@ -53,7 +57,7 @@ def write_flags(loot: Path, status: dict) -> None:
         (loot / "root.flag").write_text(status["root_flags"][0] + "\n")
     if status.get("user_flags") or status.get("root_flags"):
         (loot / "flags.json").write_text(
-            __import__("json").dumps(
+            json.dumps(
                 {"user": status.get("user_flags", []), "root": status.get("root_flags", [])},
                 indent=2,
             )
@@ -77,7 +81,6 @@ def main():
     logger.info("AUTO start target=%s logs=%s", target, sm.state_dir / "agent.log")
 
     while step < args.max_steps:
-        step += 1
         intel = merge_intel(state, parse_loot_files(sm.loot_dir))
         state.update(intel)
         persist_intel(sm.loot_dir, intel)
@@ -90,7 +93,16 @@ def main():
             break
 
         cmd, phase = playbook.next_action(state)
+        if cmd == "__STOP__" or phase == "stop":
+            logger.info("[*] playbook finished (no echo loop). state=%s", sm.state_file)
+            break
+
         cmd = inject_domain(state.get("domain"), cmd)
+        if cmd.strip().startswith("echo "):
+            logger.info("[*] skip echo noop")
+            break
+
+        step += 1
         logger.info("[*] %s [%s] %s", step, phase, cmd)
 
         result = executor.execute_with_polling(cmd)
@@ -115,8 +127,6 @@ def main():
         persist_intel(sm.loot_dir, intel)
         if intel["credentials"]:
             logger.info("[+] creds saved: %s", [c.get("username") for c in intel["credentials"]])
-        if intel["passwords"]:
-            logger.info("[+] passwords stored: %s", len(intel["passwords"]))
 
         flags = extract_flags(output)
         if flags:
@@ -143,9 +153,6 @@ def main():
         state = sm.load_state()
         if status["complete"]:
             logger.info("[+] flags user=%s root=%s", status["user_flags"], status["root_flags"])
-            break
-        if phase == "idle" and not intel["credentials"]:
-            logger.info("[*] idle without creds yet; enum artifacts in %s", sm.loot_dir)
             break
         time.sleep(1)
 

@@ -41,6 +41,7 @@ class DecisionEngine:
             "recon_complete":state.get("recon_complete"),
             "vulnerability_scan_complete":state.get("vulnerability_scan_complete"),
             "kali_tools_count":len(state.get("kali_tools",[])),
+            "kali_tool_names":[x.get("name") for x in state.get("kali_tools",[]) if x.get("name")],
             "potential_exploits_ready":state.get("potential_exploits_ready"),
             "vulnerabilities":state.get("vulnerabilities",[]),
             "privesc_candidates":state.get("privesc_candidates",[]),

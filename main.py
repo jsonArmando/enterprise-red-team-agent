@@ -2,6 +2,8 @@ import hashlib, json, logging, os, re, shlex, sys, time
 from pathlib import Path
 from typing import Optional
 from core.reasoning import ReasoningState
+from core.action_policy import ActionPolicy
+from core.world_model import WorldModel
 from core.state_manager import StateManager
 from utils.smart_executor import SmartCommandExecutor
 from nodes.dynamic_agent import CommandSanitizer, LLMDecisionEngine
@@ -98,7 +100,8 @@ class EnterpriseDynamicAgent:
         return False
 
     def _context(self,state):
-        return {"world":self._world(state),"recent_actions":[{k:h.get(k) for k in ("step","action_class","goal_id","hypothesis_id","evidence_question","resource","command","returncode","evidence_delta","capability_delta","no_new_evidence")} for h in state.get("history",[])[-12:] if h.get("event_type")=="action"],"blocked_actions":self._recent_blocked_actions(state),"mission":{"complete":bool(state.get("mission_complete")),"progress_streak":int((state.get("planner_state") or {}).get("no_progress_streak",0))}}
+        world=WorldModel(state).snapshot()
+        return {"world":world,"recent_actions":[{k:h.get(k) for k in ("step","action_class","goal_id","hypothesis_id","evidence_question","resource","command","returncode","evidence_delta","capability_delta","no_new_evidence","evidence_question_key","command_key")} for h in state.get("history",[])[-16:] if h.get("event_type")=="action"],"mission":{"complete":bool(state.get("mission_complete")),"progress_streak":int((state.get("planner_state") or {}).get("no_progress_streak",0))}}
 
     def _block(self,state,reason,decision=None):
         decision=decision or {}
@@ -125,10 +128,11 @@ class EnterpriseDynamicAgent:
             if not CommandSanitizer.validate_command_safety(d["command"]): self._block(state,"execution_policy_rejected",d); continue
             if not str(d.get("action_class") or "").strip(): self._block(state,"missing_action_class",d); continue
             if not str(d.get("evidence_question") or "").strip(): self._block(state,"missing_evidence_question",d); continue
-            if self._is_sterile_repeat(state,d):
-                self._block(state,"sterile_semantic_repeat",d)
-                context["blocked_actions"]=self._recent_blocked_actions({**state,"history":list(state.get("history",[]))+[{"event_type":"action","command":d["command"],"action_class":d.get("action_class"),"resource":d.get("resource"),"returncode":0,"no_new_evidence":True}]})
-                continue
+            decision=ActionPolicy(state.get("history",[])).evaluate(d)
+            if not decision["allowed"]:
+                self._block(state,decision["reason"],d); continue
+            d["evidence_question_key"]=decision["question_key"]
+            d["command_key"]=ActionPolicy.command_key(d["command"])
             valid={str(h.get("id")) for h in context["world"].get("hypotheses",[]) if h.get("id")}; hid=str(d.get("hypothesis_id") or "")
             if hid and valid and hid not in valid: self._block(state,"unknown_hypothesis",d); continue
             return d
@@ -137,7 +141,7 @@ class EnterpriseDynamicAgent:
     def _execute(self,state,d):
         before=self._world(state); r=self.executor.execute_with_polling(d["command"]); output=r.get("stdout","")
         if r.get("stderr"): output+="\nSTDERR:\n"+r["stderr"]
-        provisional={"event_type":"action","step":self.current_step,"action_class":d.get("action_class","unspecified"),"goal_id":d.get("goal_id",""),"hypothesis_id":d.get("hypothesis_id",""),"evidence_question":d.get("evidence_question",""),"resource":d.get("resource",""),"command":d["command"],"output":output[:8000],"returncode":r.get("returncode"),"status":r.get("status")}
+        provisional={"event_type":"action","step":self.current_step,"evidence_question_key":d.get("evidence_question_key") or ActionPolicy.question_key(d),"command_key":d.get("command_key") or ActionPolicy.command_key(d["command"]),"action_class":d.get("action_class","unspecified"),"goal_id":d.get("goal_id",""),"hypothesis_id":d.get("hypothesis_id",""),"evidence_question":d.get("evidence_question",""),"resource":d.get("resource",""),"command":d["command"],"output":output[:8000],"returncode":r.get("returncode"),"status":r.get("status")}
         after_reasoning=self.reasoning.update(output,state.get("history",[])+[provisional],d.get("command", ""))
         after={"facts":after_reasoning.get("facts",[]),"capabilities":after_reasoning.get("capabilities",[]),"hypotheses":after_reasoning.get("hypotheses",[])}
         oldf={str(x).lower() for x in before.get("facts",[])}; newf={str(x).lower() for x in after.get("facts",[])}; oldc={str(x).lower() for x in before.get("capabilities",[])}; newc={str(x).lower() for x in after.get("capabilities",[])}

@@ -15,8 +15,20 @@ ALLOWED_EXECUTABLES = {
 def _q(value: str) -> str:
     return shlex.quote(str(value))
 
-def run_shell_tool(tool: str, args: list[str], timeout: int = 900) -> str:
-    if tool not in ALLOWED_EXECUTABLES:
+BLOCKED_DYNAMIC_TOOLS = {"bash","sh","dash","zsh","fish","csh","tcsh"}
+
+def run_shell_tool(
+    tool: str,
+    args: list[str],
+    timeout: int = 900,
+    catalogued_tools: set[str] | None = None,
+) -> str:
+    allowed = set(catalogued_tools or set()) | ALLOWED_EXECUTABLES
+    if tool not in allowed or (
+        catalogued_tools is not None
+        and tool in BLOCKED_DYNAMIC_TOOLS
+        and tool not in ALLOWED_EXECUTABLES
+    ):
         raise ValueError(f"tool_not_allowlisted:{tool}")
     return call_kali_tool(tool, " ".join(_q(a) for a in args), timeout=timeout)
 

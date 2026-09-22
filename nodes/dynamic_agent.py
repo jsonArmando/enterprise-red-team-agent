@@ -132,16 +132,16 @@ class NetworkAnalyzerAndParser:
 
         if found_secrets:
             creds_file = os.path.join(loot_dir, "extracted_credentials_and_secrets.txt")
-            with open(creds_file, "a") as f:
-                for secret in found_secrets:
-                    f.write(f"{secret}\n")
-            logger.info(f"[+] [LootManager] ¡Secretos/Credenciales potenciales detectados y guardados en {creds_file}!")
+            with open(creds_file, "a", encoding="utf-8") as f:
+                for _ in found_secrets:
+                    f.write("[REDACTED_SECRET_EVIDENCE]\n")
+            logger.info(f"[+] [LootManager] Se detectaron {len(found_secrets)} líneas con posibles secretos; el contenido sensible no se persiste.")
 
         # 3. Guardado completo de la salida si contiene información de dominio o recursos valiosos
         if "sysvol" in output.lower() or "replication" in output.lower() or "domain controller" in output.lower():
             domain_info_file = os.path.join(loot_dir, "domain_structure_intelligence.txt")
-            with open(domain_info_file, "w") as f:
-                f.write(output)
+            with open(domain_info_file, "w", encoding="utf-8") as f:
+                f.write(redact_secrets(output))
             logger.info(f"[+] [LootManager] Inteligencia de Active Directory guardada en: {domain_info_file}")
 
 

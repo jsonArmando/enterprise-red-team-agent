@@ -1,6 +1,6 @@
 import hashlib
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 
 class AutonomyEngine:
@@ -120,10 +120,11 @@ class AutonomyEngine:
         for item in new_evidence_types:
             evidence.append(item)
 
-        known_facts = set(old.get("evidence_fingerprints", []))
+        known_facts = list(old.get("evidence_fingerprints", []))
+        known_fact_set = set(known_facts)
         current_facts = self._fact_lines(output)
-        new_evidence_facts = [item for item in current_facts if item not in known_facts]
-        known_facts.update(new_evidence_facts)
+        new_evidence_facts = [item for item in current_facts if item not in known_fact_set]
+        known_facts.extend(new_evidence_facts)
 
         sessions = list(old.get("sessions", []))
         session_signal = self._session_signal(command, output, entry.get("returncode"))
@@ -150,7 +151,7 @@ class AutonomyEngine:
 
         return {
             "evidence_types": evidence[-32:],
-            "evidence_fingerprints": list(known_facts)[-512:],
+            "evidence_fingerprints": known_facts[-512:],
             "sessions": sessions[-16:],
             "output_digests": history_digests[-64:],
             "progress_events": int(old.get("progress_events", 0)) + (1 if progress else 0),

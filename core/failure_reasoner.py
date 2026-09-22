@@ -72,7 +72,7 @@ class FailureReasoner:
         if "timeout" in output or "unreachable" in output:
             next_action = "recon"
         elif action in {"exploit_candidate", "validate_candidate"}:
-            next_action = "analyze_candidate" if failure.get("candidate") else "replan"
+            next_action = "replan"
         elif action in {"establish_access", "reverse_shell"}:
             next_action = "session_enum" if any(x in output for x in ("uid=", "session_established")) else "reverse_shell"
         elif action == "privilege_escalation":

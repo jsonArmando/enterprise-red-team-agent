@@ -114,7 +114,7 @@ class EnterpriseDynamicAgent:
         for entry in history:
             cmd=str(entry.get("command","")).lower()
             if ReasoningState.action_intent(cmd) == "inspect_local_artifact":
-                for token in re.findall(r"[\\w./-]+\\.(?:xml|txt|json|ini|conf|config)$", cmd):
+                for token in re.findall(r"[\w./-]+\.(?:xml|txt|json|ini|conf|config)$", cmd):
                     inspected.add(os.path.normpath(token))
         candidates=[]
         for p in sorted(loot.rglob("*")):

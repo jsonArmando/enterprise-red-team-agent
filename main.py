@@ -141,6 +141,16 @@ class EnterpriseDynamicAgent:
             if not CommandSanitizer.validate_command_safety(d["command"]): self._block(state,"execution_policy_rejected",d); continue
             if not str(d.get("action_class") or "").strip(): self._block(state,"missing_action_class",d); continue
             if not str(d.get("evidence_question") or "").strip(): self._block(state,"missing_evidence_question",d); continue
+            hypotheses=context["world"].get("hypotheses",[])
+            goals=context["world"].get("candidate_goals",[])
+            if hypotheses and not str(d.get("hypothesis_id") or "").strip():
+                self._block(state,"missing_hypothesis_id",d); continue
+            if hypotheses and str(d.get("hypothesis_id") or "") not in {str(h.get("id")) for h in hypotheses}:
+                self._block(state,"unknown_hypothesis",d); continue
+            if goals and str(d.get("goal_id") or "") and str(d.get("goal_id")) not in {str(g.get("id")) for g in goals}:
+                self._block(state,"unknown_goal",d); continue
+            logger.info("[?] Planner rationale=%s | hypothesis=%s | goal=%s | question=%s",
+                        d.get("rationale",""), d.get("hypothesis_id",""), d.get("goal_id",""), d.get("evidence_question",""))
             constraints=context.get("selection_constraints",{})
             if constraints.get("rotate_surface") and ReasoningState.action_intent(d["command"]).startswith("enumerate_ldap:"):
                 self._block(state,"surface_rotation_required",d)

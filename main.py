@@ -86,7 +86,7 @@ def main():
     setup_logging(sm.state_dir / "agent.log")
     state = sm.load_state()
     playbook = LabPlaybook(target, sm.state_dir)
-    executor = SmartCommandExecutor(timeout_minutes=12, poll_interval=10)
+    executor = SmartCommandExecutor(timeout_minutes=6, poll_interval=10)
     step = state.get("step_count", 0)
 
     logger.info("AUTO start target=%s logs=%s", target, sm.state_dir / "agent.log")
@@ -106,18 +106,23 @@ def main():
 
         cmd, phase = playbook.next_action(state)
         if cmd == "__STOP__" or phase == "stop":
-            logger.info("[*] playbook finished. exploits=%s", sm.loot_dir / "potential_exploits.json")
+            logger.info("[*] playbook finished (no more steps). not a crash.")
             break
 
         cmd = inject_domain(state.get("domain"), cmd)
-        if cmd.strip().startswith("echo "):
-            logger.info("[*] skip echo noop")
-            break
+        if cmd.strip().startswith("echo ") and "osticket_probe" not in cmd and "LFI" not in cmd:
+            logger.info("[*] skip echo noop -> next")
+            sm.save_state(step, {"command": cmd, "output": "skipped"}, phase, False)
+            state = sm.load_state()
+            continue
 
         step += 1
         logger.info("[*] %s [%s] %s", step, phase, cmd)
 
         result = executor.execute_with_polling(cmd)
+        st = result.get("status") or "completed"
+        if st == "timeout_killed":
+            logger.warning("[*] timeout on step %s — saving output and CONTINUING", step)
         output = (result.get("stdout") or "") + "\n" + (result.get("stderr") or "")
         (sm.state_dir / "logs").mkdir(exist_ok=True)
         (sm.state_dir / "logs" / f"step_{step:02d}.log").write_text(output, encoding="utf-8")
@@ -153,7 +158,13 @@ def main():
         write_flags(sm.loot_dir, status)
         sm.save_state(
             step,
-            {"step": step, "command": cmd, "output": output[-8000:], "phase": phase},
+            {
+                "step": step,
+                "command": cmd,
+                "output": output[-8000:],
+                "phase": phase,
+                "exec_status": st,
+            },
             phase=phase,
             mission_complete=status["complete"],
             credentials=intel["credentials"],
@@ -168,6 +179,7 @@ def main():
         if status["complete"]:
             logger.info("[+] flags user=%s root=%s", status["user_flags"], status["root_flags"])
             break
+        logger.info("[*] step %s done (%s) -> next", step, st)
         time.sleep(1)
 
 

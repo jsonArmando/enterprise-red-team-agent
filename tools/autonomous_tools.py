@@ -2,6 +2,7 @@
 from __future__ import annotations
 import shlex
 from pathlib import Path
+import os
 from typing import Any
 from tools.mcp_client import call_kali_mcp_tool
 from tools.mcp_router import call_kali_tool
@@ -31,6 +32,14 @@ def run_vulnerability_scan(target: str, out: Path) -> str:
 
 def run_cve_lookup(cve: str) -> str:
     return run_shell_tool("searchsploit", ["--json", cve], timeout=120)
+
+def run_mcp_validate(target: str, candidate: dict[str, Any]) -> str:
+    return call_kali_mcp_tool(os.getenv("MCP_VALIDATE_TOOL", "validate_vulnerability"), {
+        "target": target,
+        "candidate": candidate,
+        "evidence_lines": candidate.get("evidence_lines", []),
+        "mode": "authorized_lab",
+    })
 
 def run_mcp_exploit(target: str, candidate: dict[str, Any]) -> str:
     return call_kali_mcp_tool("execute_exploit_module", {

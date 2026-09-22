@@ -168,9 +168,9 @@ class EnterpriseDynamicAgent:
         return None
 
     def _execute(self,state,d):
-        before=self._world(state); r=self.executor.execute_with_polling(d["command"]); output=r.get("stdout","")
+        before=self._world(state); started=time.monotonic(); r=self.executor.execute_with_polling(d["command"]); execution_ms=round((time.monotonic()-started)*1000); output=r.get("stdout","")
         if r.get("stderr"): output+="\nSTDERR:\n"+r["stderr"]
-        provisional={"event_type":"action","step":self.current_step,"evidence_question_key":d.get("evidence_question_key") or ActionPolicy.question_key(d),"command_key":d.get("command_key") or ActionPolicy.command_key(d["command"]),"action_class":d.get("action_class","unspecified"),"goal_id":d.get("goal_id",""),"hypothesis_id":d.get("hypothesis_id",""),"evidence_question":d.get("evidence_question",""),"resource":d.get("resource",""),"command":d["command"],"output":output[:8000],"returncode":r.get("returncode"),"status":r.get("status")}
+        provisional={"event_type":"action","step":self.current_step,"evidence_question_key":d.get("evidence_question_key") or ActionPolicy.question_key(d),"command_key":d.get("command_key") or ActionPolicy.command_key(d["command"]),"action_class":d.get("action_class","unspecified"),"goal_id":d.get("goal_id",""),"hypothesis_id":d.get("hypothesis_id",""),"evidence_question":d.get("evidence_question",""),"resource":d.get("resource",""),"command":d["command"],"output":output[:8000],"returncode":r.get("returncode"),"status":r.get("status"),"planner_latency_ms":d.get("_planner_latency_ms"),"execution_latency_ms":execution_ms}
         after_reasoning=self.reasoning.update(output,state.get("history",[])+[provisional],d.get("command", ""))
         after={"facts":after_reasoning.get("facts",[]),"capabilities":after_reasoning.get("capabilities",[]),"hypotheses":after_reasoning.get("hypotheses",[])}
         oldf={str(x).lower() for x in before.get("facts",[])}; newf={str(x).lower() for x in after.get("facts",[])}; oldc={str(x).lower() for x in before.get("capabilities",[])}; newc={str(x).lower() for x in after.get("capabilities",[])}
@@ -179,7 +179,9 @@ class EnterpriseDynamicAgent:
             if h.get("id") in oldh and isinstance(h.get("confidence"),(int,float)) and isinstance(oldh[h.get("id")],(int,float)): conf+=abs(float(h["confidence"])-float(oldh[h.get("id")]))
         delta={"fact_delta":len(newf-oldf),"capability_delta":len(newc-oldc),"hypothesis_confidence_delta":round(conf,4),"output_digest":self._digest(output) if output else ""}
         progress=delta["fact_delta"]>0 or delta["capability_delta"]>0 or delta["hypothesis_confidence_delta"]>0.05
-        provisional.update({"evidence_delta":delta,"capability_delta":delta["capability_delta"],"no_new_evidence":not progress,"output_digest":delta["output_digest"]}); return provisional
+        provisional.update({"evidence_delta":delta,"capability_delta":delta["capability_delta"],"no_new_evidence":not progress,"output_digest":delta["output_digest"]})
+        logger.info("[=] Evidence | exec=%sms | rc=%s | facts+%s | capabilities+%s | hypothesis_delta=%s | progress=%s | digest=%s", execution_ms, r.get("returncode"), delta["fact_delta"], delta["capability_delta"], delta["hypothesis_confidence_delta"], progress, delta["output_digest"])
+        return provisional
 
     def run_autonomous_loop(self):
         while MAX_STEPS is None or self.current_step<=MAX_STEPS:

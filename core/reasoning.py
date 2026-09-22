@@ -173,7 +173,7 @@ class ReasoningState:
                 "cost": round(max(0.0, min(1.0, cost)), 3),
             }
 
-        if re.search(r"anonymous|guest|unauthenticated|['"]%['"]|\b-u\s+['"]?['"]?|\s-n\b", text):
+        if re.search(r'anonymous|guest|unauthenticated|[\'"]%[\'"]|\b-u\s+[\'"]?[\'"]?|\s-n\b', text):
             signal(
                 "anonymous_remote_access", 0.9,
                 ["anonymous/unauthenticated remote access observed"],

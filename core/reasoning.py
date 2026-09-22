@@ -80,6 +80,21 @@ class ReasoningState:
         return cls._unique(capabilities, 32)
 
     @staticmethod
+    def action_intent(command: str) -> str:
+        """Canonicalize command variants into a generic semantic intent."""
+        text = re.sub(r"\s+", " ", str(command or "").strip().lower())
+        if not text:
+            return "empty"
+        if any(x in text for x in ("decrypt", "decode", "decipher", "base64", "aes.new", "openssl enc")):
+            return "transform_credential_or_secret_material"
+        if any(x in text for x in ("cat ", "head ", "tail ", "less ", "more ", "jq ", "xmllint ", "grep ")):
+            return "inspect_local_artifact"
+        if any(x in text for x in ("get ", "mget ", "wget ", "curl ", "download")):
+            return "retrieve_remote_artifact"
+        if any(x in text for x in ("ldapsearch", "rpcclient", "enum4linux", "smbmap")):
+            return "enumerate_remote_surface"
+        return text[:180]
+    @staticmethod
     def generate_hypotheses(facts: List[str], capabilities: List[str]) -> List[Dict[str, Any]]:
         hypotheses = []
         def add(hid: str, statement: str, tests: List[str]):

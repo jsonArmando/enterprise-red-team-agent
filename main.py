@@ -5,6 +5,7 @@ from core.state_manager import StateManager
 from utils.smart_executor import SmartCommandExecutor
 from utils.exploit_matcher import ExploitMatcher
 from nodes.dynamic_agent import LLMDecisionEngine, CommandSanitizer
+from core.autonomy import AutonomyEngine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", handlers=[logging.StreamHandler(sys.stdout)])
 logger=logging.getLogger("EnterpriseDynamicAgent")
@@ -22,6 +23,7 @@ class EnterpriseDynamicAgent:
         self.current_step=int(state.get("step_count",0))+1
         self.executor=SmartCommandExecutor(timeout_minutes=20,poll_interval=15)
         self.exploit_matcher=ExploitMatcher(target_ip)
+        self.autonomy=AutonomyEngine(target_ip)
 
     def extract_domain_from_scan(self,scan_content:str):
         if self.domain_name:return
@@ -181,9 +183,12 @@ class EnterpriseDynamicAgent:
             if cmd: blocked.append(re.sub(r"\s+"," ",cmd.strip()))
         planner=LLMDecisionEngine(); augmented_history=list(history)
         completed=self.completed_goals(history)
+        autonomy_context=self.autonomy.context(state)
         planner_context=("No hay flag todavía. Debes continuar la auditoría. NO declares mission_complete hasta detectar una flag. "
                          "No repitas objetivos de conocimiento ya completados con éxito; cambia de objetivo salvo que exista evidencia nueva de fallo o necesidad. "
                          f"Objetivos ya completados: {json.dumps(sorted(completed))}. "
+                         "El LLM conserva libertad táctica para elegir el siguiente objetivo y herramienta; el supervisor solo impide repeticiones estériles, corrupción del estado y finalización sin evidencia. "
+                         f"Estado de autonomía: {json.dumps(autonomy_context, ensure_ascii=False)}. "
                          "Comandos ya ejecutados y que NO debes repetir exactamente: "+json.dumps(blocked)+"\\n")
         if potential_exploit and potential_exploit.get("available"):
             planner_context += ("Existe potential_exploit como metadata de candidatos. Debes validar aplicabilidad contra la evidencia antes de proponer cualquier acción; NO trates campos de SearchSploit como comandos ejecutables. Candidatos: "+json.dumps(potential_exploit,ensure_ascii=False)[:6000])
@@ -248,7 +253,9 @@ class EnterpriseDynamicAgent:
             logger.info("[*] Paso %d/%d | %s | %s",self.current_step,MAX_STEPS,action_id,command)
             result=self.executor.execute_with_polling(command); output=result.get("stdout","")
             if result.get("stderr"):output+="\nSTDERR:\n"+result["stderr"]
-            self.state_manager.save_state(self.current_step,{"step":self.current_step,"action_id":action_id,"command":command,"output":output[:8000],"status":result.get("status"),"returncode":result.get("returncode")},phase,False,extra={"last_action_id":action_id,"last_command_fingerprint":fp,"action_attempts":{**state.get("action_attempts",{}),action_id:attempts+1},"potential_exploit":getattr(self,"current_potential_exploit",{"available":False,"candidate_count":0,"candidates":[]})})
+            entry={"step":self.current_step,"action_id":action_id,"command":command,"output":output[:8000],"status":result.get("status"),"returncode":result.get("returncode")}
+            autonomy_update=self.autonomy.observe(state, entry)
+            self.state_manager.save_state(self.current_step,entry,phase,False,extra={"last_action_id":action_id,"last_command_fingerprint":fp,"action_attempts":{**state.get("action_attempts",{}),action_id:attempts+1},"potential_exploit":getattr(self,"current_potential_exploit",{"available":False,"candidate_count":0,"candidates":[]}),"autonomy":autonomy_update})
             self.current_step+=1; time.sleep(1)
         logger.warning("[!] Límite de seguridad de %d pasos alcanzado sin flag; la misión NO se marca como completada.",MAX_STEPS)
 

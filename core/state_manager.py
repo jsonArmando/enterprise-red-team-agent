@@ -1,5 +1,6 @@
 import json, logging, os, subprocess
 from pathlib import Path
+from core.security import redact_secrets
 logger=logging.getLogger("EnterpriseDynamicAgent")
 class StateManager:
     def __init__(self,target_ip):
@@ -23,21 +24,28 @@ class StateManager:
               "vulnerabilities":vulnerabilities if vulnerabilities is not None else old.get("vulnerabilities",[]),
               "credentials":credentials if credentials is not None else old.get("credentials",[])}
         if extra:data.update(extra)
-        tmp=self.state_file.with_suffix(".json.tmp"); tmp.write_text(json.dumps(data,indent=2,ensure_ascii=False),encoding="utf-8"); tmp.replace(self.state_file)
+        self._atomic_write(redact_secrets(data), self.state_file)
     def mark_complete(self,reason,step):
         data={**self.load_state(),"step_count":step,"mission_complete":True,"completion_reason":reason}
-        tmp=self.state_file.with_suffix(".json.tmp"); tmp.write_text(json.dumps(data,indent=2,ensure_ascii=False),encoding="utf-8"); tmp.replace(self.state_file)
+        self._atomic_write(redact_secrets(data), self.state_file)
+    @staticmethod
+    def _atomic_write(data,path):
+        tmp=path.with_suffix(".json.tmp"); tmp.write_text(json.dumps(data,indent=2,ensure_ascii=False),encoding="utf-8"); tmp.replace(path)
     def load_state(self):
         if self.state_file.exists():
             try:
                 d=json.loads(self.state_file.read_text(encoding="utf-8"))
-                d.setdefault("history",[]); d.setdefault("completed_actions",[]); d.setdefault("action_attempts",{}); d.setdefault("mission_complete",False); d.setdefault("planner_state",{"status":"READY","stalled_attempts":0,"blocked_goals":[],"blocked_actions":[],"recovery_attempts":[],"last_reason":""}); return d
+                d.setdefault("history",[]); d.setdefault("completed_actions",[]); d.setdefault("action_attempts",{}); d.setdefault("mission_complete",False)
+                d.setdefault("planner_state",{"status":"READY","stalled_attempts":0,"blocked_goals":[],"blocked_actions":[],"recovery_attempts":[],"last_reason":"","no_progress_streak":0})
+                return d
             except Exception as e:logger.error("[-] state read: %s",e)
-        return {"target":self.target_ip,"phase":"recon","step_count":0,"mission_complete":False,"last_output":"","history":[],"discovered_services":[],"vulnerabilities":[],"credentials":[],"completed_actions":[],"action_attempts":{},"planner_state":{"status":"READY","stalled_attempts":0,"blocked_goals":[],"blocked_actions":[],"recovery_attempts":[],"last_reason":""}}
+        return {"target":self.target_ip,"phase":"recon","step_count":0,"mission_complete":False,"last_output":"","history":[],"discovered_services":[],"vulnerabilities":[],"credentials":[],"completed_actions":[],"action_attempts":{},"planner_state":{"status":"READY","stalled_attempts":0,"blocked_goals":[],"blocked_actions":[],"recovery_attempts":[],"last_reason":"","no_progress_streak":0}}
 def get_target_dir(target):
     p=Path(f"testing/{target}"); p.mkdir(parents=True,exist_ok=True); (p/"scans").mkdir(exist_ok=True); (p/"loot").mkdir(exist_ok=True); return str(p)
 def save_persistent_state(state):
     target=state.get("target") or state.get("mission_target")
     if not target:return
-    p=Path(get_target_dir(target))/"agent_state.json"; tmp=p.with_suffix(".json.tmp"); tmp.write_text(json.dumps(state,indent=2,ensure_ascii=False),encoding="utf-8"); tmp.replace(p)
-def save_loot(target,name,content): (Path(get_target_dir(target))/"loot"/name).write_text(content,encoding="utf-8")
+    p=Path(get_target_dir(target))/"agent_state.json"; tmp=p.with_suffix(".json.tmp"); tmp.write_text(json.dumps(redact_secrets(state),indent=2,ensure_ascii=False),encoding="utf-8"); tmp.replace(p)
+def save_loot(target,name,content):
+    safe_name=Path(name).name
+    (Path(get_target_dir(target))/"loot"/safe_name).write_text(redact_secrets(content),encoding="utf-8")

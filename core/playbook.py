@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from core.lfi_probe import probe_command
+
 STOP = ("__STOP__", "stop")
 
 OSTICKET_PATHS = "/ /scp /open.php /login.php /tickets.php /kb/faq.php"
@@ -45,7 +47,6 @@ class LabPlaybook:
         if not (self.scans / "version_scan.txt").exists():
             return (f"nmap -Pn -sC -sV -p- --min-rate 800 -oN {self.scans}/version_scan.txt {ip}", "recon")
 
-        # --- Phase 1 web / osTicket (before long AD enum) ---
         if web and not self._done(history, "web_headers.txt"):
             return (
                 f"curl -skI --max-time 12 http://{ip} -o {self.loot}/web_headers.txt; "
@@ -69,6 +70,8 @@ class LabPlaybook:
             )
         if web and not self._done(history, "whatweb"):
             return (f"whatweb -a 3 --color=never http://{ip} 2>/dev/null | tee {self.loot}/whatweb.txt || true", "recon")
+        if web and not self._done(history, "LFI probe"):
+            return (probe_command(ip, self.loot), "enum")
 
         if ad and not self._done(history, "-u '' -p ''"):
             return (f"nxc smb {ip} -u '' -p '' --shares", "enum")

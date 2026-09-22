@@ -1,4 +1,4 @@
-import sys, json, time, re, logging, base64, hashlib
+import sys, json, time, re, logging, base64, hashlib, os, shlex
 from pathlib import Path
 from Crypto.Cipher import AES
 from core.state_manager import StateManager, save_persistent_state
@@ -98,6 +98,41 @@ class EnterpriseDynamicAgent:
                 if flag_re.search(data): found.append(str(p))
             except (OSError,UnicodeError): continue
         return sorted(set(found))
+
+    def next_uninspected_local_artifact(self, state):
+        """Return a generic read-only inspection for the first newly retrieved text artifact.
+
+        This is an evidence gate, not a target-specific playbook: when a prior action
+        retrieves a local artifact, inspect that evidence before launching a broader
+        remote enumeration that cannot explain the newly available data.
+        """
+        loot=Path(f"testing/{self.target_ip}/loot")
+        if not loot.exists():
+            return None
+        history=state.get("history",[])
+        inspected=set()
+        for entry in history:
+            cmd=str(entry.get("command","")).lower()
+            if ReasoningState.action_intent(cmd) == "inspect_local_artifact":
+                for token in re.findall(r"[\\w./-]+\\.(?:xml|txt|json|ini|conf|config)$", cmd):
+                    inspected.add(os.path.normpath(token))
+        candidates=[]
+        for p in sorted(loot.rglob("*")):
+            if not p.is_file() or p.suffix.lower() not in {".xml",".txt",".json",".ini",".conf",".config"}:
+                continue
+            rel=os.path.relpath(p, Path.cwd())
+            if rel in inspected or str(p) in inspected:
+                continue
+            try:
+                if p.stat().st_size > 2_000_000:
+                    continue
+            except OSError:
+                continue
+            candidates.append(rel)
+        if not candidates:
+            return None
+        artifact=candidates[0]
+        return f"sed -n '1,240p' {shlex.quote(artifact)}"
 
     def load_potential_exploit(self):
         """Carga candidatos de SearchSploit como metadata; nunca los trata como comandos ejecutables."""
@@ -349,6 +384,13 @@ class EnterpriseDynamicAgent:
         domain=self.domain_name or "active.htb"; loot=Path(f"testing/{self.target_ip}/loot"); loot.mkdir(parents=True,exist_ok=True)
         if not list(loot.glob("**/*.xml")) and not any("Replication" in c for c in commands):
             return (f"smbclient -U '%' -N //{self.target_ip}/Replication -c 'recurse ON; prompt OFF; lcd {loot}; mget *Groups.xml'","exploitation","enum.replication")
+        # Evidence-first gate: inspect newly retrieved local artifacts before
+        # broad remote enumeration. The rule is generic and does not name a target,
+        # credential, account, share, or attack path.
+        artifact_action=self.next_uninspected_local_artifact(state)
+        if artifact_action:
+            return artifact_action,"evidence","artifact.inspect"
+
         # Las nuevas credenciales/capacidades ya no disparan una receta fija.
         # Se entregan al modelo del mundo y al razonador para que determine qué
         # hipótesis merece ser investigada a continuación.

@@ -101,8 +101,21 @@ class EnterpriseDynamicAgent:
 
     def _context(self,state):
         world=WorldModel(state).snapshot()
-        return {"world":world,"recent_actions":[{k:h.get(k) for k in ("step","action_class","goal_id","hypothesis_id","evidence_question","resource","command","returncode","evidence_delta","capability_delta","no_new_evidence","evidence_question_key","command_key")} for h in state.get("history",[])[-16:] if h.get("event_type")=="action"],"mission":{"complete":bool(state.get("mission_complete")),"progress_streak":int((state.get("planner_state") or {}).get("no_progress_streak",0))}}
-
+        recent=[{k:h.get(k) for k in ("step","action_class","goal_id","hypothesis_id","evidence_question","resource","command","returncode","evidence_delta","capability_delta","no_new_evidence","evidence_question_key","command_key")} for h in state.get("history",[])[-16:] if h.get("event_type")=="action"]
+        intents=[ReasoningState.action_intent(h.get("command","")) for h in state.get("history",[])[-8:] if h.get("event_type")=="action"]
+        ldap_streak=0
+        for intent in reversed(intents):
+            if intent.startswith("enumerate_ldap:"):
+                ldap_streak += 1
+            else:
+                break
+        smb_available="smb_surface" in world.get("capabilities",[]) or "smb_access" in world.get("capabilities",[])
+        constraints={
+            "rotate_surface": bool(ldap_streak >= 2 and smb_available),
+            "reason": "LDAP has dominated the last actions; choose a different observed surface with available evidence." if ldap_streak >= 2 and smb_available else "",
+            "available_alternative_surfaces": ["SMB/remote resources"] if smb_available else []
+        }
+        return {"world":world,"recent_actions":recent,"selection_constraints":constraints,"mission":{"complete":bool(state.get("mission_complete")),"progress_streak":int((state.get("planner_state") or {}).get("no_progress_streak",0))}}
     def _block(self,state,reason,decision=None):
         decision=decision or {}
         logger.warning("[!] Planner rejection: %s | action_class=%s | resource=%s | command=%s", reason, decision.get("action_class",""), decision.get("resource",""), decision.get("command",""))

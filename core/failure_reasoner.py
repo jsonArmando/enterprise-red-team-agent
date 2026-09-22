@@ -5,7 +5,7 @@ from typing import Any
 
 RECOVERY_ACTIONS = {
     "recon","vulnerability_scan","cve_lookup","analyze_candidate","validate_candidate",
-    "exploit_candidate","discover_kali_tools","establish_access","reverse_shell",
+    "exploit_candidate","run_kali_tool","discover_kali_tools","establish_access","reverse_shell",
     "session_enum","post_exploit_enum","analyze_privesc","privilege_escalation",
     "verify_flags","replan",
 }

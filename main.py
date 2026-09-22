@@ -360,6 +360,8 @@ class EnterpriseDynamicAgent:
                          "si aporta una dimensión distinta de evidencia. No conviertas ldap_query, SMB, RPC ni enumeración en objetivos de una sola ejecución. "
                          "Si no puedes proponer una acción nueva, devuelve command vacío y el supervisor activará un fallback táctico. "
                          "El LLM conserva libertad táctica para elegir el siguiente objetivo y herramienta; el supervisor impide repeticiones estériles. "
+                         "Prioriza hipótesis con evidencia fuerte y alto expected_information_gain sobre enumeración genérica. "
+                         "Cuando exista una hipótesis de exposición de políticas/artefactos respaldada por evidencia, prueba primero sus tests de mayor información antes de abrir otra superficie. "
                          f"Estado de autonomía: {json.dumps(autonomy_context, ensure_ascii=False)}. "
                          f"Modelo del mundo: {json.dumps(reasoning_context, ensure_ascii=False)}. "
                          f"CONTROLADOR OBLIGATORIO: modo={controller_mode}; hipótesis bajo presión={controller_hypothesis}; "
@@ -391,6 +393,10 @@ class EnterpriseDynamicAgent:
             if normalized in blocked:
                 blocked_actions.add(action_id)
                 augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_DUPLICATE]","output":f"Comando ya ejecutado: {cmd}"})
+                continue
+            valid_hypotheses={str(h.get("id")) for h in reasoning_context.get("hypotheses", []) if h.get("id")}
+            if selected_hypothesis and selected_hypothesis not in valid_hypotheses:
+                augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_UNKNOWN_HYPOTHESIS]","output":f"Hipótesis desconocida: {selected_hypothesis}"})
                 continue
             if selected_hypothesis and selected_hypothesis in set(deprioritized):
                 augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_DEPRIORITIZED_HYPOTHESIS]","output":f"Hipótesis depriorizada: {selected_hypothesis}"})
@@ -436,6 +442,17 @@ class EnterpriseDynamicAgent:
         # credential, account, share, or attack path.
         artifact_action=self.next_uninspected_local_artifact(state)
         if artifact_action:
+            # Attribute evidence inspection to the highest-ranked hypothesis that
+            # explicitly benefits from artifact analysis. This keeps the action
+            # grounded in the world model without encoding a target playbook.
+            reasoning_context=self.reasoning.context()
+            candidates=[
+                h for h in reasoning_context.get("hypotheses", [])
+                if "artifact_contents" in h.get("tests", [])
+                and h.get("id") not in set(reasoning_context.get("hypothesis_control", {}).get("deprioritized", []))
+            ]
+            if candidates:
+                self._selected_hypothesis_id=candidates[0].get("id","")
             return artifact_action,"evidence",f"artifact.inspect.{self.fingerprint(artifact_action)}"
 
         # Las nuevas credenciales/capacidades ya no disparan una receta fija.

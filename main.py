@@ -122,6 +122,8 @@ class EnterpriseDynamicAgent:
         text=re.sub(r"\\s+"," ",command.lower().strip())
         if any(x in text for x in ("ntpdate","timedatectl","chronyc")):
             return "ntp_time_synchronization"
+        if any(x in text for x in ("psexec","wmiexec","smbexec","evil-winrm","winrm","xfreerdp","rdesktop")):
+            return "remote_session_access"
         if any(x in text for x in ("--users","enumdomusers","enumerate users","objectclass=user")):
             return "enumerate_domain_users"
         if any(x in text for x in ("--groups","enumdomgroups","enumerate groups","objectclass=group")):
@@ -150,7 +152,7 @@ class EnterpriseDynamicAgent:
         family=EnterpriseDynamicAgent.action_family(command)
         if family in {"enumerate_domain_users","enumerate_domain_groups","enumerate_smb_shares",
                       "retrieve_replication_artifacts","analyze_gpp_artifacts","kerberos_spn_enumeration",
-                      "asrep_enumeration","ad_graph_collection","credential_dump_analysis"}:
+                      "asrep_enumeration","ad_graph_collection","credential_dump_analysis","remote_session_access"}:
             return family
         if family=="ntp_time_synchronization":
             return family
@@ -238,6 +240,10 @@ class EnterpriseDynamicAgent:
             semantic_repeats=self.semantic_repeats(recent,command)
             goal=self.action_goal(command)
             completed_goals=self.completed_goals(recent)
+            if goal=="remote_session_access" and goal in completed_goals:
+                logger.warning("[!] Objetivo de acceso remoto ya completado; se bloquea otra variante sin evidencia nueva.")
+                state.setdefault("history",[]).append({"step":self.current_step,"command":"[BLOCKED_NO_PROGRESS]","output":f"Objetivo ya completado: {goal}"})
+                self.state_manager.save_state(self.current_step,state["history"][-1],"autonomous",False); self.current_step+=1; continue
             if goal=="ntp_time_synchronization" and goal in completed_goals:
                 logger.warning("[!] Objetivo NTP ya completado; se bloquea nueva sincronización sin evidencia nueva.")
                 state.setdefault("history",[]).append({"step":self.current_step,"command":"[BLOCKED_NO_PROGRESS]","output":f"Objetivo ya completado: {goal}"})

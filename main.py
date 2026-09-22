@@ -101,19 +101,18 @@ class EnterpriseDynamicAgent:
 
     def _context(self,state):
         world=WorldModel(state).snapshot()
-        recent=[{k:h.get(k) for k in ("step","action_class","goal_id","hypothesis_id","evidence_question","resource","command","returncode","evidence_delta","capability_delta","no_new_evidence","evidence_question_key","command_key")} for h in state.get("history",[])[-16:] if h.get("event_type")=="action"]
-        intents=[ReasoningState.action_intent(h.get("command","")) for h in state.get("history",[])[-8:] if h.get("event_type")=="action"]
-        ldap_streak=0
-        for intent in reversed(intents):
-            if intent.startswith("enumerate_ldap:"):
-                ldap_streak += 1
-            else:
-                break
+        actions=[h for h in state.get("history",[]) if h.get("event_type")=="action"][-12:]
+        recent=[{k:h.get(k) for k in ("step","action_class","goal_id","hypothesis_id","evidence_question","resource","command","returncode","evidence_delta","capability_delta","no_new_evidence","evidence_question_key","command_key")} for h in actions[-16:]]
+        ldap_actions=[h for h in actions if ReasoningState.action_intent(h.get("command","")).startswith("enumerate_ldap:")]
+        ldap_low_info=sum(1 for h in ldap_actions if h.get("no_new_evidence") is True)
         smb_available="smb_surface" in world.get("capabilities",[]) or "smb_access" in world.get("capabilities",[])
+        rotate=bool(smb_available and len(ldap_actions)>=3 and ldap_low_info>=2)
         constraints={
-            "rotate_surface": bool(ldap_streak >= 2 and smb_available),
-            "reason": "LDAP has dominated the last actions; choose a different observed surface with available evidence." if ldap_streak >= 2 and smb_available else "",
-            "available_alternative_surfaces": ["SMB/remote resources"] if smb_available else []
+            "rotate_surface": rotate,
+            "reason": "LDAP family is saturated: recent LDAP actions produced low information. Switch to an observed alternative surface." if rotate else "",
+            "available_alternative_surfaces": ["SMB/remote resources"] if smb_available else [],
+            "recent_ldap_actions": len(ldap_actions),
+            "recent_ldap_low_information": ldap_low_info
         }
         return {"world":world,"recent_actions":recent,"selection_constraints":constraints,"mission":{"complete":bool(state.get("mission_complete")),"progress_streak":int((state.get("planner_state") or {}).get("no_progress_streak",0))}}
     def _block(self,state,reason,decision=None):
@@ -149,8 +148,9 @@ class EnterpriseDynamicAgent:
                 self._block(state,"unknown_hypothesis",d); continue
             if goals and str(d.get("goal_id") or "") and str(d.get("goal_id")) not in {str(g.get("id")) for g in goals}:
                 self._block(state,"unknown_goal",d); continue
-            logger.info("[?] Planner rationale=%s | hypothesis=%s | goal=%s | question=%s",
-                        d.get("rationale",""), d.get("hypothesis_id",""), d.get("goal_id",""), d.get("evidence_question",""))
+            logger.info("[?] Decision | latency=%sms | class=%s | intent=%s | hypothesis=%s | goal=%s | resource=%s | question=%s | rationale=%s",
+                        d.get("_planner_latency_ms","?"), d.get("action_class",""), ReasoningState.action_intent(d["command"]),
+                        d.get("hypothesis_id",""), d.get("goal_id",""), d.get("resource",""), d.get("evidence_question",""), d.get("rationale",""))
             constraints=context.get("selection_constraints",{})
             if constraints.get("rotate_surface") and ReasoningState.action_intent(d["command"]).startswith("enumerate_ldap:"):
                 self._block(state,"surface_rotation_required",d)

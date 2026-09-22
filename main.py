@@ -275,6 +275,15 @@ class EnterpriseDynamicAgent:
             last_reason="no_new_action"
         )
         logger.warning("[!] Planner agotó sus %d reintentos sin una acción nueva.",MAX_PLANNER_RETRIES)
+        if stalled >= MAX_PLANNER_STALLS:
+            exhausted=self.persist_planner_state(
+                updated,
+                status="EXHAUSTED",
+                stalled_attempts=stalled,
+                last_reason="planner_stall_budget_exhausted"
+            )
+            logger.error("[!] Presupuesto de estancamiento del planner agotado (%d); deteniendo misión sin entrar en recovery infinito.",MAX_PLANNER_STALLS)
+            return None
         return self.recovery_action(updated)
 
     def determine_next_action(self,state):

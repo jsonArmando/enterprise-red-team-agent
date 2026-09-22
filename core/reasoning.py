@@ -144,35 +144,174 @@ class ReasoningState:
         return list(resources.values())[-64:]
 
     @staticmethod
-    def generate_hypotheses(facts: List[str], capabilities: List[str]) -> List[Dict[str, Any]]:
+    def derive_vulnerability_signals(
+        facts: List[str], capabilities: List[str], history: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Derive generic vulnerability signals from observed evidence and actions.
+
+        Signals are evidence abstractions, not target-specific playbooks and never
+        contain exploit payloads or commands.
+        """
+        recent = history[-16:]
+        text = " ".join(
+            facts
+            + [str(h.get("output", "")) for h in recent]
+            + [str(h.get("command", "")) for h in recent]
+        ).lower()
+        signals: Dict[str, Any] = {}
+
+        def signal(name: str, strength: float, evidence: List[str], info_gain: float, cost: float):
+            signals[name] = {
+                "strength": round(max(0.0, min(1.0, strength)), 3),
+                "evidence": evidence[-8:],
+                "expected_information_gain": round(max(0.0, min(1.0, info_gain)), 3),
+                "cost": round(max(0.0, min(1.0, cost)), 3),
+            }
+
+        if re.search(r"anonymous|guest|unauthenticated|['"]%['"]|\b-u\s+['"]?['"]?|\s-n\b", text):
+            signal(
+                "anonymous_remote_access", 0.9,
+                ["anonymous/unauthenticated remote access observed"],
+                0.85, 0.2
+            )
+
+        if "smb_access" in capabilities and re.search(r"replication|sysvol|netlogon|gpo|group policy|policy artifact", text):
+            signal(
+                "policy_share_exposure", 0.95,
+                ["SMB policy/domain share evidence observed"],
+                0.95, 0.2
+            )
+
+        if re.search(r"\b(?:groups?\.xml|cpassword|gpp|group policy preference|policy artifact)\b", text):
+            signal(
+                "policy_artifact_exposure", 1.0,
+                ["policy artifact or GPP indicator observed"],
+                1.0, 0.15
+            )
+
+        if re.search(r"\b(?:spn|serviceprincipalname|kerberos|cifs/)\b", text):
+            signal(
+                "service_identity_relationship", 0.85,
+                ["service identity relationship observed"],
+                0.8, 0.35
+            )
+
+        if re.search(r"\b(?:password|credential|cpassword|secret|hash|ntlm)\b", text):
+            signal(
+                "credential_material_exposure", 0.95,
+                ["credential/secret material indicator observed"],
+                0.95, 0.25
+            )
+
+        if re.search(r"\b(?:administrator|system|root|privilege|delegation)\b", text):
+            signal(
+                "privilege_transition_signal", 0.8,
+                ["privilege-related evidence observed"],
+                0.8, 0.45
+            )
+        return signals
+
+    @staticmethod
+    def generate_hypotheses(
+        facts: List[str], capabilities: List[str], history: List[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        history = history or []
+        signals = ReasoningState.derive_vulnerability_signals(facts, capabilities, history)
         hypotheses = []
-        def add(hid: str, statement: str, tests: List[str]):
-            hypotheses.append({"id": hid, "statement": statement, "tests": tests})
+
+        def add(
+            hid: str, statement: str, tests: List[str], signal_names: List[str],
+            expected_information_gain: float, cost: float
+        ):
+            evidence = []
+            strength = 0.0
+            for name in signal_names:
+                item = signals.get(name)
+                if item:
+                    strength = max(strength, float(item.get("strength", 0.0)))
+                    evidence.extend(item.get("evidence", []))
+            hypotheses.append({
+                "id": hid,
+                "statement": statement,
+                "tests": tests,
+                "evidence": list(dict.fromkeys(evidence))[-8:],
+                "confidence": round(strength, 3),
+                "expected_information_gain": round(expected_information_gain, 3),
+                "cost": round(cost, 3),
+            })
+
+        if signals.get("policy_artifact_exposure") or signals.get("policy_share_exposure"):
+            add(
+                "H-POLICY-EXPOSURE",
+                "Los recursos de políticas accesibles pueden contener artefactos de configuración que revelen material sensible o nuevas capacidades.",
+                ["artifact_contents", "identity_material", "capability_transition"],
+                ["policy_artifact_exposure", "policy_share_exposure"],
+                0.98, 0.15
+            )
+
+        if signals.get("credential_material_exposure"):
+            add(
+                "H-CREDENTIAL-MATERIAL",
+                "La evidencia de material de autenticación puede permitir identificar una capacidad reutilizable y debe validarse antes de cambiar de superficie.",
+                ["identity_material", "capability_transition"],
+                ["credential_material_exposure"],
+                0.95, 0.25
+            )
+
+        if signals.get("service_identity_relationship"):
+            add(
+                "H-SERVICE-IDENTITY",
+                "Las relaciones entre identidades y servicios pueden revelar una vía adicional de autenticación o privilegio.",
+                ["service_relationships", "capability_transition"],
+                ["service_identity_relationship"],
+                0.85, 0.35
+            )
 
         if "authenticated_identity" in capabilities:
-            add("H-AUTH-EXPANSION",
+            add(
+                "H-AUTH-EXPANSION",
                 "La identidad obtenida puede habilitar nuevas relaciones o recursos que no eran visibles antes.",
-                ["directory_enumeration", "share_access", "service_relationships"])
+                ["directory_enumeration", "share_access", "service_relationships"],
+                [],
+                0.75, 0.3
+            )
+
         if "directory_enumeration" in capabilities:
-            add("H-AD-RELATIONSHIPS",
+            add(
+                "H-AD-RELATIONSHIPS",
                 "La superficie de directorio puede contener relaciones entre identidades, grupos y servicios que cambien la ruta de la misión.",
-                ["users", "groups", "service_relationships"])
+                ["users", "groups", "service_relationships"],
+                [],
+                0.7, 0.3
+            )
+
         if "service_relationship_visibility" in capabilities:
-            add("H-SERVICE-PATH",
+            add(
+                "H-SERVICE-PATH",
                 "Una relación de servicio observada puede justificar una nueva investigación de acceso o privilegio.",
-                ["service_relationships", "access_transition"])
-        if "policy_artifact_access" in capabilities:
-            add("H-POLICY-DATA",
-                "Los artefactos de política pueden contener información que habilite capacidades adicionales.",
-                ["artifact_contents", "identity_material"])
+                ["service_relationships", "access_transition"],
+                ["service_identity_relationship"],
+                0.8, 0.4
+            )
+
         if "smb_access" in capabilities:
-            add("H-RESOURCE-SURFACE",
+            add(
+                "H-RESOURCE-SURFACE",
                 "El acceso SMB puede exponer recursos distintos con evidencia adicional.",
-                ["shares", "files", "permissions"])
+                ["shares", "files", "permissions"],
+                [],
+                0.55, 0.35
+            )
+
         if "privilege_signal" in capabilities:
-            add("H-PRIVILEGE-TRANSITION",
+            add(
+                "H-PRIVILEGE-TRANSITION",
                 "La evidencia de privilegio puede representar una transición de capacidad que debe verificarse.",
-                ["session", "privilege_context"])
+                ["session", "privilege_context"],
+                ["privilege_transition_signal"],
+                0.8, 0.45
+            )
+
         return hypotheses[:12]
 
     @staticmethod
@@ -196,6 +335,9 @@ class ReasoningState:
             score += 1.5 * progress
             score -= 1.25 * no_progress
             score += min(1.5, 0.25 * len(capabilities))
+            score += 2.0 * float(h.get("confidence", 0.0))
+            score += 2.5 * float(h.get("expected_information_gain", 0.0))
+            score -= 1.0 * float(h.get("cost", 0.0))
             item = dict(h)
             item["control"] = {
                 "score": round(max(0.0, score), 3),
@@ -203,6 +345,9 @@ class ReasoningState:
                 "progress_events": progress,
                 "no_progress": no_progress,
                 "status": "promising" if score >= 2.0 else "deprioritized",
+                "confidence": h.get("confidence", 0.0),
+                "expected_information_gain": h.get("expected_information_gain", 0.0),
+                "cost": h.get("cost", 0.0),
             }
             ranked.append(item)
         return sorted(ranked, key=lambda x: x.get("control", {}).get("score", 0), reverse=True)[:12]
@@ -303,7 +448,7 @@ class ReasoningState:
         new_facts = self.extract_facts(output)
         facts = self._unique(old_facts + new_facts, 256)
         capabilities = self.derive_capabilities(facts, history)
-        hypotheses = self.generate_hypotheses(facts, capabilities)
+        hypotheses = self.generate_hypotheses(facts, capabilities, history)
         hypotheses = self.score_hypotheses(hypotheses, capabilities, history, self.old)
         control = self.control_signal(hypotheses)
         hypothesis_control = self.build_hypothesis_control(hypotheses, control, self.old)

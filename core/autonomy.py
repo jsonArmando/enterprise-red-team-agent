@@ -15,7 +15,7 @@ class AutonomyEngine:
 
     @staticmethod
     def _normalize(text: str) -> str:
-        return re.sub(r"\\s+", " ", str(text or "").strip())
+        return re.sub(r"\s+", " ", str(text or "").strip())
 
     @staticmethod
     def _evidence_types(output: str) -> List[str]:

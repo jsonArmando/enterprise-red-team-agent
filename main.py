@@ -8,6 +8,7 @@ from core.audit import AuditTrail
 from core.cve_engine import build_inventory, merge_inventory
 from core.flags import mission_status
 from core.decision_engine import DecisionEngine
+from core.policy_engine import evaluate_policy
 from tools.autonomous_tools import (
     run_recon, run_vulnerability_scan, run_cve_lookup,
     run_mcp_exploit, run_post_exploit, verify_flags_remote,
@@ -20,6 +21,9 @@ class EnterpriseDynamicAgent:
         self.workdir = Path(f"testing/{target_ip}")
         self.audit = AuditTrail(self.workdir)
         self.engine = DecisionEngine()
+        self.scope_policy = {"allowed_networks": None, "allowed_domains": [".htb", ".lab", ".local"]}
+        if not evaluate_policy(target_ip, self.scope_policy):
+            raise SystemExit(f"Target blocked by scope policy: {target_ip}")
 
     def load(self) -> dict:
         state = self.manager.load_state()

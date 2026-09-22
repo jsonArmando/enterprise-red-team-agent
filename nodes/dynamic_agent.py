@@ -175,7 +175,8 @@ class LLMDecisionEngine:
             '  "thought": "Análisis táctico detallado justificando el siguiente paso técnico",\n'
             '  "command": "Comando exacto de Kali Linux a ejecutar sin comentarios",\n'
             '  "mission_complete": false\n'
-            "}"
+            "}"\n"
+            "Regla crítica: mission_complete SOLO puede ser true cuando exista evidencia de una FLAG real en la salida o en testing/<target>/loot. Si no hay flag, debes proponer otra acción; no declares la auditoría completada por falta de vectores inmediatos.\n"
         )
 
         # Ventana de contexto optimizada para evitar saturación de tokens
@@ -296,7 +297,27 @@ def dynamic_redteam_node(state: Dict[str, Any]) -> Dict[str, Any]:
             command_to_execute = f"smbclient '\\\\{target}\\Replication' -N"
             
         thought = decision.get("thought", "Razonamiento autónomo ejecutado con éxito.")
-        mission_complete = decision.get("mission_complete", False)
+        mission_complete = bool(decision.get("mission_complete", False))
+        flag_re = re.compile(r"(?:flag|htb)\\{[^}]{4,200}\\}", re.I)
+        flag_evidence = bool(flag_re.search(last_output or ""))
+        loot_root = os.path.join(target_dir, "loot")
+        if os.path.isdir(loot_root):
+            for root_dir, _, files in os.walk(loot_root):
+                if any(name.lower() in {"user.txt", "root.txt", "flag.txt", "user.flag", "root.flag", "flags.json"} for name in files):
+                    flag_evidence = True
+                    break
+                for name in files:
+                    path = os.path.join(root_dir, name)
+                    try:
+                        if os.path.getsize(path) <= 2_000_000 and flag_re.search(open(path, encoding="utf-8", errors="ignore").read()):
+                            flag_evidence = True
+                            break
+                    except (OSError, UnicodeError):
+                        pass
+                if flag_evidence: break
+        if mission_complete and not flag_evidence:
+            logger.warning("[!] El LLM pidió finalizar sin flag; se ignora mission_complete y se continúa.")
+            mission_complete = False
 
     logger.info(f"[*] [Razonamiento del Agente]: {thought}")
     

@@ -127,7 +127,11 @@ class EnterpriseDynamicAgent:
                 for token in tokens:
                     if Path(token).suffix.lower() in {".xml",".txt",".json",".ini",".conf",".config"}:
                         inspected.add(normalized(token))
-            if entry.get("returncode") == 0 and intent.startswith("retrieve_remote_artifact"):
+            retrieval_success = (
+                entry.get("returncode") == 0
+                or str(entry.get("status","")).lower() in {"success","completed","ok"}
+            )
+            if retrieval_success and intent.startswith("retrieve_remote_artifact"):
                 retrieval_seen=True
                 output=str(entry.get("output",""))
                 for token in re.findall(r"(?:[\w./-]+/)?[\w.-]+\.(?:xml|txt|json|ini|conf|config)", output, re.I):
@@ -157,6 +161,14 @@ class EnterpriseDynamicAgent:
 
         if not candidates:
             return None
+
+        # Prefer the newest local evidence. Retrieval tools do not consistently
+        # print the downloaded filename, so filesystem evidence is authoritative
+        # once a successful retrieval has been observed.
+        candidates.sort(key=lambda item: (
+            Path(item).stat().st_mtime if Path(item).exists() else 0,
+            Path(item).stat().st_size if Path(item).exists() else 0,
+        ), reverse=True)
         artifact=candidates[0]
         return f"sed -n '1,240p' {shlex.quote(artifact)}"
 

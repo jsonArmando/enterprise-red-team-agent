@@ -17,8 +17,7 @@ from core.kali_tools import KaliToolCatalog
 from utils.exploit_matcher import ExploitMatcher
 from tools.autonomous_tools import (
     run_recon, run_vulnerability_scan, run_cve_lookup,
-    run_mcp_validate, run_mcp_exploit, run_session_manager,
-    run_reverse_shell, run_post_exploit, run_privilege_escalation,
+    run_mcp_validate, run_mcp_exploit, run_post_exploit, run_privilege_escalation,
     verify_flags_remote, run_shell_tool,
 )
 from tools.mcp_client import call_kali_mcp_tool
@@ -233,20 +232,20 @@ class EnterpriseDynamicAgent:
                 failure=self.register_failure(state,action,output,cid,c)
 
         elif action=="establish_access":
-            output=run_session_manager(self.target,"establish",{
+            session=self.sessions.establish({
                 "foothold":state.get("foothold",False),
                 "access_evidence":state.get("access_evidence",""),
             })
-            session=self.sessions._parse(output)
-            state["session"]=session
-            state["session_established"]=bool(session.get("connected"))
+            output=session.evidence
+            state["session"]=asdict(session)
+            state["session_established"]=bool(session.connected)
             state["foothold"]=state.get("foothold",False) or state["session_established"]
             if not state["session_established"]:
                 failure=self.register_failure(state,action,output)
 
         elif action=="reverse_shell":
             state["reverse_shell_attempted"]=True
-            output=run_reverse_shell(self.target,{
+            output=self.reverse_shell.establish({
                 "foothold":state.get("foothold",False),
                 "access_evidence":state.get("access_evidence",""),
                 "previous_session":state.get("session",{}),
@@ -259,7 +258,7 @@ class EnterpriseDynamicAgent:
                 failure=self.register_failure(state,action,output)
 
         elif action=="session_enum":
-            output=run_session_manager(self.target,"inspect",{"session":state.get("session",{})})
+            output=self.sessions.inspect(state.get("session",{}))
             state["session_evidence"]=output[:12000]
 
         elif action=="post_exploit_enum":

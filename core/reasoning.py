@@ -43,8 +43,10 @@ class ReasoningState:
         return result[-limit:]
 
     @classmethod
-    def extract_facts(cls, output: str) -> List[str]:
+    def extract_facts(cls, output: str, command: str = "") -> List[str]:
+        """Extract evidence without requiring benchmark-specific keywords."""
         facts = []
+        cmd = str(command or "").lower()
         for raw in str(output or "").splitlines():
             line = cls._norm(raw)
             if len(line) < 3:
@@ -52,8 +54,19 @@ class ReasoningState:
             lower = line.lower()
             if lower.startswith(("warning:", "error:", "debug:", "traceback")):
                 continue
-            # Preserve useful lines, but cap their size so state remains bounded.
-            if any(pattern.search(line) for _, pattern in cls._PATTERNS):
+            structured = bool(re.search(
+                r"^(?:dn|dc|ou|cn|uid|member|memberof|samaccountname|userprincipalname|objectclass|"
+                r"namingcontexts|defaultnamingcontext|distinguishedname|serviceprincipalname|"
+                r"port|state|service|version|host|address|server|share)\s*[:=]",
+                line, re.I
+            ))
+            if "ldapsearch" in cmd:
+                structured = structured or bool(re.search(
+                    r"^(?:dn|objectclass|namingcontexts|defaultnamingcontext|distinguishedname|"
+                    r"cn|ou|dc|samaccountname|userprincipalname|memberof|serviceprincipalname)\s*[:=]",
+                    line, re.I
+                ))
+            if structured or any(pattern.search(line) for _, pattern in cls._PATTERNS):
                 facts.append(line[:320])
         return cls._unique(facts, 64)
 
@@ -448,9 +461,9 @@ class ReasoningState:
                     })
         return goals[:16]
 
-    def update(self, output: str, history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def update(self, output: str, history: List[Dict[str, Any]], command: str = "") -> Dict[str, Any]:
         old_facts = list(self.old.get("facts", []))
-        new_facts = self.extract_facts(output)
+        new_facts = self.extract_facts(output, command)
         facts = self._unique(old_facts + new_facts, 256)
         capabilities = self.derive_capabilities(facts, history)
         hypotheses = self.generate_hypotheses(facts, capabilities, history)

@@ -91,7 +91,7 @@ class ReasoningState:
             return "empty"
         if any(x in text for x in ("decrypt", "decode", "decipher", "base64", "aes.new", "openssl enc")):
             return "transform_credential_or_secret_material"
-        if any(x in text for x in ("cat ", "head ", "tail ", "less ", "more ", "jq ", "xmllint ", "grep ")):
+        if any(x in text for x in ("cat ", "head ", "tail ", "less ", "more ", "jq ", "xmllint ", "grep ", "sed ")):
             return "inspect_local_artifact"
         if any(x in text for x in ("get ", "mget ", "wget ", "curl ", "download")):
             return "retrieve_remote_artifact"

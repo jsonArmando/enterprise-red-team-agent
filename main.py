@@ -11,7 +11,7 @@ from core.security import redact_secrets
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", handlers=[logging.StreamHandler(sys.stdout)])
 logger=logging.getLogger("EnterpriseDynamicAgent")
 
-MAX_STEPS=200
+MAX_STEPS=None  # Sin límite de pasos; la misión termina al detectar flag o por un safety stop.
 MAX_SAME_ACTION_ATTEMPTS=3
 MAX_PLANNER_RETRIES=2
 MAX_PLANNER_STALLS=3
@@ -315,7 +315,7 @@ class EnterpriseDynamicAgent:
         return "","autonomous","planner.stalled"
 
     def run_autonomous_loop(self):
-        while self.current_step<=MAX_STEPS:
+        while MAX_STEPS is None or self.current_step<=MAX_STEPS:
             state=self.state_manager.load_state()
             if state.get("mission_complete"):return
             flags=self.flags_found()
@@ -349,7 +349,8 @@ class EnterpriseDynamicAgent:
                 logger.warning("[!] Acción repetida bloqueada: %s. Se fuerza replanning autónomo.",action_id)
                 state.setdefault("history",[]).append({"step":self.current_step,"command":"[BLOCKED_DUPLICATE]","output":f"Acción bloqueada: {command}"})
                 self.state_manager.save_state(self.current_step,state["history"][-1],"autonomous",False); self.current_step+=1; continue
-            logger.info("[*] Paso %d/%d | %s | %s",self.current_step,MAX_STEPS,action_id,redact_secrets(command))
+            step_limit = str(MAX_STEPS) if MAX_STEPS is not None else "∞"
+            logger.info("[*] Paso %d/%s | %s | %s",self.current_step,step_limit,action_id,redact_secrets(command))
             if not CommandSanitizer.validate_command_safety(command):
                 logger.error("[!] Política de ejecución bloqueó la acción; misión detenida sin marcarse como completada.")
                 self.persist_planner_state(state,status="EXHAUSTED",last_reason="command_policy_blocked")
@@ -381,7 +382,8 @@ class EnterpriseDynamicAgent:
                 self.persist_planner_state({**state,"autonomy":autonomy_update},status="EXHAUSTED",stalled_attempts=planner_stalls,no_progress_streak=progress_streak,last_reason="progress_budget_exhausted")
                 return
             self.current_step+=1; time.sleep(1)
-        logger.warning("[!] Límite de seguridad de %d pasos alcanzado sin flag; la misión NO se marca como completada.",MAX_STEPS)
+        if MAX_STEPS is not None:
+            logger.warning("[!] Límite de seguridad de %d pasos alcanzado sin flag; la misión NO se marca como completada.",MAX_STEPS)
 
 if __name__=="__main__":
     EnterpriseDynamicAgent(sys.argv[1] if len(sys.argv)>1 else "10.129.9.175").run_autonomous_loop()

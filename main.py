@@ -163,12 +163,6 @@ class EnterpriseDynamicAgent:
             if d.get("mission_complete"):
                 if self.flags_found(): self.state_manager.mark_complete("flag_found",self.current_step)
                 return
-            key=self._norm(f"{d.get('goal_id','')}|{d.get('evidence_question','')}|{d.get('resource','')}")
-            duplicate=any(key==self._norm(f"{h.get('goal_id','')}|{h.get('evidence_question','')}|{h.get('resource','')}") and h.get("returncode")==0 and h.get("no_new_evidence") is False for h in state.get("history",[])[-12:])
-            if duplicate and d.get("action_class")!="inspect_artifact":
-                self._block(state,"semantic_evidence_question_already_answered",d); self.current_step+=1; continue
-            if self._is_sterile_repeat(state,d):
-                self._block(state,"sterile_semantic_repeat",d); self.current_step+=1; continue
             logger.info("[*] Paso %d/%s | %s | %s",self.current_step,MAX_STEPS or "∞",d.get("action_class","action"),d["command"])
             if not CommandSanitizer.validate_command_safety(d["command"]): self._block(state,"execution_policy_rejected",d); return
             entry=self._execute(state,d); ps=dict(state.get("planner_state") or {}); streak=int(ps.get("no_progress_streak",0)); streak=streak+1 if entry.get("no_new_evidence") else 0

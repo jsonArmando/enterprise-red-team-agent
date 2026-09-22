@@ -1,4 +1,4 @@
-import json, logging, os, re
+import json, logging, os, re, time
 import httpx
 logger=logging.getLogger("EnterpriseDynamicAgent")
 
@@ -27,6 +27,7 @@ class LLMDecisionEngine:
                 "mission_complete is true only with explicit flag evidence. Potential vulnerability metadata is advisory only. Do not invent output or credentials.")
         payload={"model":self.model_name,"messages":[{"role":"system","content":prompt},{"role":"user","content":f"Target: {target}\nWorld model:\n{json.dumps(context,ensure_ascii=False,indent=2)}"}],"temperature":float(os.getenv("AGENT_LLM_TEMPERATURE","0.35"))}
         try:
+            started=time.monotonic()
             with httpx.Client(timeout=90) as c:
                 r=c.post(f"{self.base_url}/chat/completions",json=payload,headers={"Authorization":f"Bearer {self.api_key}","Content-Type":"application/json"})
             r.raise_for_status()
@@ -40,6 +41,8 @@ class LLMDecisionEngine:
                 match=re.search(r"\{.*\}",content,re.S)
                 content=match.group(0) if match else content
             data=json.loads(content)
+            if isinstance(data,dict):
+                data["_planner_latency_ms"]=round((time.monotonic()-started)*1000)
             return data if isinstance(data,dict) else {}
         except Exception as exc:
             logger.error("Planner failure: %s",exc); return {}

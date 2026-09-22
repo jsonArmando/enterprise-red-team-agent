@@ -350,6 +350,10 @@ class EnterpriseDynamicAgent:
                 state.setdefault("history",[]).append({"step":self.current_step,"command":"[BLOCKED_DUPLICATE]","output":f"Acción bloqueada: {command}"})
                 self.state_manager.save_state(self.current_step,state["history"][-1],"autonomous",False); self.current_step+=1; continue
             logger.info("[*] Paso %d/%d | %s | %s",self.current_step,MAX_STEPS,action_id,redact_secrets(command))
+            if not CommandSanitizer.validate_command_safety(command):
+                logger.error("[!] Política de ejecución bloqueó la acción; misión detenida sin marcarse como completada.")
+                self.persist_planner_state(state,status="EXHAUSTED",last_reason="command_policy_blocked")
+                return
             result=self.executor.execute_with_polling(command); output=result.get("stdout","")
             if result.get("stderr"):output+="\nSTDERR:\n"+result["stderr"]
             raw_entry={"step":self.current_step,"action_id":action_id,"command":command,"output":output[:8000],"status":result.get("status"),"returncode":result.get("returncode")}

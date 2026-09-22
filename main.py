@@ -269,6 +269,10 @@ class EnterpriseDynamicAgent:
         blocked_actions=set(planner_state.get("blocked_actions",[]))
         autonomy_context=self.autonomy.context(state)
         reasoning_context=self.reasoning.context()
+        hypothesis_control=reasoning_context.get("hypothesis_control", {})
+        controller_mode=str(reasoning_context.get("control_signal", {}).get("mode", "explore"))
+        controller_hypothesis=reasoning_context.get("control_signal", {}).get("hypothesis")
+        deprioritized=hypothesis_control.get("deprioritized", [])
         planner_context=("No hay flag todavía. Debes continuar la auditoría. NO declares mission_complete hasta detectar una flag. "
                          "Una acción exitosa NO significa que el objetivo semántico esté agotado: puedes y debes usar otra consulta/herramienta "
                          "si aporta una dimensión distinta de evidencia. No conviertas ldap_query, SMB, RPC ni enumeración en objetivos de una sola ejecución. "
@@ -276,6 +280,11 @@ class EnterpriseDynamicAgent:
                          "El LLM conserva libertad táctica para elegir el siguiente objetivo y herramienta; el supervisor impide repeticiones estériles. "
                          f"Estado de autonomía: {json.dumps(autonomy_context, ensure_ascii=False)}. "
                          f"Modelo del mundo: {json.dumps(reasoning_context, ensure_ascii=False)}. "
+                         f"CONTROLADOR OBLIGATORIO: modo={controller_mode}; hipótesis bajo presión={controller_hypothesis}; "
+                         f"hipótesis depriorizadas={json.dumps(deprioritized)}. "
+                         "Si modo=switch_hypothesis, DEBES seleccionar una hipótesis distinta y devolver hypothesis_id. "
+                         "No reutilices una hipótesis depriorizada salvo que nueva evidencia la reactive. "
+                         "El supervisor rechazará una propuesta que viole esta directiva. "
                          "Comandos ya ejecutados y que NO debes repetir exactamente: "+json.dumps(blocked)+"\n")
         if potential_exploit and potential_exploit.get("available"):
             planner_context += ("Potential_exploit es SOLO metadata de candidatos y requiere validación contra evidencia; nunca lo trates como comando ejecutable. Candidatos: "+json.dumps(potential_exploit,ensure_ascii=False)[:6000])
@@ -300,6 +309,15 @@ class EnterpriseDynamicAgent:
             if normalized in blocked:
                 blocked_actions.add(action_id)
                 augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_DUPLICATE]","output":f"Comando ya ejecutado: {cmd}"})
+                continue
+            if selected_hypothesis and selected_hypothesis in set(deprioritized):
+                augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_DEPRIORITIZED_HYPOTHESIS]","output":f"Hipótesis depriorizada: {selected_hypothesis}"})
+                continue
+            if controller_mode == "switch_hypothesis" and selected_hypothesis == controller_hypothesis:
+                augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_STALE_HYPOTHESIS]","output":f"El controlador exige cambiar de hipótesis: {controller_hypothesis}"})
+                continue
+            if controller_mode == "switch_hypothesis" and not selected_hypothesis:
+                augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_MISSING_HYPOTHESIS]","output":"El controlador exige hypothesis_id."})
                 continue
             self._selected_hypothesis_id = selected_hypothesis
             return cmd,"autonomous",action_id

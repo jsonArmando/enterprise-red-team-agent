@@ -150,11 +150,11 @@ class ReasoningState:
         text = str(output or "")
         entities = {"identities": [], "groups": [], "shares": [], "artifacts": [], "services": []}
         patterns = {
-            "identities": (r"(?im)^\\s*(?:user|username|account|sAMAccountName)\\s*[:=]\\s*([A-Za-z0-9_.@\\\\-]+)",),
-            "groups": (r"(?im)^\\s*(?:group|groupname|cn)\\s*[:=]\\s*([A-Za-z0-9_.@\\\\-]+)",),
-            "shares": (r"(?im)^\\s*([A-Za-z0-9$_.-]{2,})\\s+(?:Disk|IPC|Printer|Remote|Special|Unknown)\\b",),
-            "artifacts": (r"(?im)\\b([A-Za-z0-9_.-]+\\.(?:xml|ini|conf|config|txt|json|pcap))\\b",),
-            "services": (r"(?im)\\b([A-Za-z0-9_.-]+/(?:[A-Za-z0-9_.-]+))\\b",),
+            "identities": (r"(?im)^\s*(?:user|username|account|sAMAccountName)\s*[:=]\s*([A-Za-z0-9_.@\-]+)",),
+            "groups": (r"(?im)^\s*(?:group|groupname|cn)\s*[:=]\s*([A-Za-z0-9_.@\-]+)",),
+            "shares": (r"(?im)^\s*([A-Za-z0-9$_.-]{2,})\s+(?:Disk|IPC|Printer|Remote|Special|Unknown)\b",),
+            "artifacts": (r"(?im)\b([A-Za-z0-9_.-]+\.(?:xml|ini|conf|config|txt|json|pcap))\b",),
+            "services": (r"(?im)\b([A-Za-z0-9_.-]+/(?:[A-Za-z0-9_.-]+))\b",),
         }
         for kind, pats in patterns.items():
             for pat in pats:

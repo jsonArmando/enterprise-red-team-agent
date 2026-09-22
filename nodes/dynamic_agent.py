@@ -29,7 +29,17 @@ class LLMDecisionEngine:
         try:
             with httpx.Client(timeout=90) as c:
                 r=c.post(f"{self.base_url}/chat/completions",json=payload,headers={"Authorization":f"Bearer {self.api_key}","Content-Type":"application/json"})
-            r.raise_for_status(); content=r.json()["choices"][0]["message"]["content"].replace(chr(96),"").strip()
-            data=json.loads(content); return data if isinstance(data,dict) else {}
+            r.raise_for_status()
+            message=r.json()["choices"][0].get("message",{})
+            content=message.get("content","")
+            if isinstance(content,list):
+                content="".join(str(x.get("text","") if isinstance(x,dict) else x) for x in content)
+            content=str(content).strip()
+            content=re.sub(r"^```(?:json)?\\s*|\\s*```$","",content,flags=re.I|re.S).strip()
+            if not content.startswith("{"):
+                match=re.search(r"\\{.*\\}",content,re.S)
+                content=match.group(0) if match else content
+            data=json.loads(content)
+            return data if isinstance(data,dict) else {}
         except Exception as exc:
             logger.error("Planner failure: %s",exc); return {}

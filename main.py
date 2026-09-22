@@ -141,6 +141,12 @@ class EnterpriseDynamicAgent:
             if not CommandSanitizer.validate_command_safety(d["command"]): self._block(state,"execution_policy_rejected",d); continue
             if not str(d.get("action_class") or "").strip(): self._block(state,"missing_action_class",d); continue
             if not str(d.get("evidence_question") or "").strip(): self._block(state,"missing_evidence_question",d); continue
+            constraints=context.get("selection_constraints",{})
+            if constraints.get("rotate_surface") and ReasoningState.action_intent(d["command"]).startswith("enumerate_ldap:"):
+                self._block(state,"surface_rotation_required",d)
+                constraints["avoid_action_prefixes"]=["enumerate_ldap:"]
+                constraints["last_rejection"]="The candidate stayed on the dominant LDAP family; select an observed alternative surface."
+                continue
             decision=ActionPolicy(state.get("history",[])).evaluate(d)
             if not decision["allowed"]:
                 self._block(state,decision["reason"],d); continue

@@ -192,6 +192,8 @@ class EnterpriseDynamicAgent:
         """Adquisición de evidencia sin depender del LLM."""
         history=state.get("history",[])
         executed={re.sub(r"\s+"," ",h.get("command","").strip()) for h in history if h.get("command")}
+        planner_state=state.get("planner_state") or {}
+        attempted=set(planner_state.get("recovery_attempts",[]))
         scan=self.scan_path()
         scan_text=scan.read_text(encoding="utf-8",errors="ignore").lower() if scan.exists() else ""
         candidates=[]
@@ -202,9 +204,13 @@ class EnterpriseDynamicAgent:
         if "135/tcp" in scan_text:
             candidates.append((f"rpcclient -U '' -N {self.target_ip} -c 'srvinfo'","recovery.rpc_info"))
         for command,action_id in candidates:
-            if re.sub(r"\s+"," ",command.strip()) not in executed:
-                logger.warning("[RECOVERY] Planner estancado; adquiriendo evidencia con %s",action_id)
-                return command,"recovery",action_id
+            normalized=re.sub(r"\s+"," ",command.strip())
+            if action_id in attempted or normalized in executed:
+                continue
+            new_planner_state={**planner_state,"status":"RECOVERY","recovery_attempts":sorted(attempted|{action_id}),"last_reason":action_id}
+            save_persistent_state({**state,"planner_state":new_planner_state})
+            logger.warning("[RECOVERY] Planner estancado; reservando %s como única recuperación nueva.",action_id)
+            return command,"recovery",action_id
         return None
 
     def autonomous_fallback(self,state,potential_exploit=None):
@@ -248,10 +254,11 @@ class EnterpriseDynamicAgent:
                 augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_DUPLICATE]","output":f"Comando ya ejecutado: {cmd}"})
                 continue
             return cmd,"autonomous",f"llm.{self.fingerprint(cmd)}"
-        logger.warning("[!] Planner agotó sus reintentos sin una acción nueva.")
-        self.persist_planner_state(state,status="STALLED",stalled_attempts=int(planner_state.get("stalled_attempts",0))+1,
+        stalled=int(planner_state.get("stalled_attempts",0))+1
+        updated=self.persist_planner_state(state,status="STALLED",stalled_attempts=stalled,
                                    blocked_goals=sorted(set(completed)|blocked_goals),last_reason="no_new_action")
-        return self.recovery_action(state)
+        logger.warning("[!] Planner agotó sus %d reintentos sin una acción nueva.",MAX_PLANNER_RETRIES)
+        return self.recovery_action(updated)
 
     def determine_next_action(self,state):
         history=state.get("history",[]); commands=[h.get("command","") for h in history]
@@ -285,15 +292,9 @@ class EnterpriseDynamicAgent:
             if not command:
                 planner_state=state.get("planner_state") or {}
                 stalls=int(planner_state.get("stalled_attempts",0))
-                if stalls >= MAX_PLANNER_STALLS:
-                    logger.error("[!] Planner agotado tras %d bloqueos; se detiene el ciclo.",stalls)
-                    self.persist_planner_state(state,status="EXHAUSTED",stalled_attempts=stalls,last_reason="planner_exhausted")
-                    return
-                logger.warning("[!] Planner sin acción nueva; se conserva el estado y se intenta recuperación.")
-                self.persist_planner_state(state,status="STALLED",stalled_attempts=stalls+1,last_reason="no_action")
-                time.sleep(min(2*(stalls+1),6))
-                self.current_step+=1
-                continue
+                logger.error("[!] No existe una acción nueva ni una recuperación disponible. Estado=%s; deteniendo misión para evitar ciclo.",planner_state.get("status","UNKNOWN"))
+                self.persist_planner_state(state,status="EXHAUSTED",stalled_attempts=stalls,last_reason="no_action_and_no_recovery")
+                return
             attempts=state.get("action_attempts",{}).get(action_id,0); recent=state.get("history",[]); fp=self.fingerprint(command)
             repeats=sum(self.fingerprint(h.get("command",""))==fp for h in recent[-6:])
             semantic_repeats=self.semantic_repeats(recent,command)

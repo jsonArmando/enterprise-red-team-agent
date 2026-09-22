@@ -100,28 +100,37 @@ class EnterpriseDynamicAgent:
         return sorted(set(found))
 
     def next_uninspected_local_artifact(self, state):
-        """Return a generic read-only inspection for the first newly retrieved text artifact.
-
-        This is an evidence gate, not a target-specific playbook: when a prior action
-        retrieves a local artifact, inspect that evidence before launching a broader
-        remote enumeration that cannot explain the newly available data.
-        """
+        """Select a newly retrieved local artifact as evidence, excluding generated metadata."""
         loot=Path(f"testing/{self.target_ip}/loot")
         if not loot.exists():
             return None
         history=state.get("history",[])
         inspected=set()
+        retrieved=set()
         for entry in history:
-            cmd=str(entry.get("command","")).lower()
-            if ReasoningState.action_intent(cmd) == "inspect_local_artifact":
-                for token in re.findall(r"[\w./-]+\.(?:xml|txt|json|ini|conf|config)$", cmd):
+            cmd=str(entry.get("command",""))
+            intent=ReasoningState.action_intent(cmd)
+            if intent == "inspect_local_artifact":
+                for token in re.findall(r"[\\w./-]+\\.(?:xml|txt|json|ini|conf|config)$", cmd.lower()):
                     inspected.add(os.path.normpath(token))
+            if entry.get("returncode") == 0 and intent == "retrieve_remote_artifact":
+                output=str(entry.get("output",""))
+                for token in re.findall(r"(?:[\\w./-]+/)?[\\w.-]+\\.(?:xml|txt|json|ini|conf|config)", output, re.I):
+                    retrieved.add(os.path.normpath(token))
+        # Generated intelligence is not mission evidence to consume before the
+        # artifacts retrieved from the target.
+        generated={"potential_exploits.json"}
         candidates=[]
         for p in sorted(loot.rglob("*")):
-            if not p.is_file() or p.suffix.lower() not in {".xml",".txt",".json",".ini",".conf",".config"}:
+            if not p.is_file() or p.name.lower() in generated:
                 continue
-            rel=os.path.relpath(p, Path.cwd())
+            if p.suffix.lower() not in {".xml",".txt",".json",".ini",".conf",".config"}:
+                continue
+            rel=os.path.normpath(os.path.relpath(p, Path.cwd()))
             if rel in inspected or str(p) in inspected:
+                continue
+            # Prefer artifacts explicitly reported by a successful retrieval.
+            if retrieved and not any(rel.endswith(x) or str(p).endswith(x) for x in retrieved):
                 continue
             try:
                 if p.stat().st_size > 2_000_000:

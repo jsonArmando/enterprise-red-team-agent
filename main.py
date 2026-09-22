@@ -17,7 +17,7 @@ from core.kali_tools import KaliToolCatalog
 from utils.exploit_matcher import ExploitMatcher
 from tools.autonomous_tools import (
     run_recon, run_vulnerability_scan, run_cve_lookup,
-    run_mcp_validate, run_mcp_exploit, run_post_exploit, run_privilege_escalation,
+    run_mcp_validate, run_mcp_exploit, run_post_exploit, run_privilege_validation, run_privilege_escalation,
     verify_flags_remote, run_shell_tool,
 )
 from tools.mcp_client import call_kali_mcp_tool
@@ -289,8 +289,25 @@ class EnterpriseDynamicAgent:
                     h["status"]="analyzed"
             output=json.dumps(analysis,ensure_ascii=False)
 
+        elif action=="validate_privesc":
+            selected=[h for h in state.get("privesc_candidates",[]) if h.get("status")=="analyzed"]
+            if not selected:
+                return state,{"event_type":"blocked","action":action,"reason":"no_analyzed_privesc_hypothesis"}
+            hypothesis=selected[0]
+            output=run_privilege_validation(self.target,hypothesis)
+            valid="VALIDATED" in output.upper() or "VULNERABILITY_CONFIRMED" in output.upper()
+            if valid:
+                hypothesis["status"]="validated"
+                hypothesis["validation_evidence"]=output[:12000]
+            else:
+                hypothesis["status"]="rejected"
+                hypothesis["validation_evidence"]=output[:12000]
+                failure=self.register_failure(state,action,output,None,hypothesis)
+
         elif action=="privilege_escalation":
             selected=[h for h in state.get("privesc_candidates",[]) if h.get("status")=="validated"]
+            if not selected:
+                return state,{"event_type":"blocked","action":action,"reason":"no_validated_privesc_hypothesis"}
             output=run_privilege_escalation(self.target,{
                 "session":state.get("session",{}),
                 "evidence":state.get("session_evidence",""),
@@ -298,7 +315,7 @@ class EnterpriseDynamicAgent:
             success=self.structured_success(output)
             state["privesc_result"]=output[:12000]
             if not success and "root.txt" not in output.lower():
-                failure=self.register_failure(state,action,output)
+                failure=self.register_failure(state,action,output,None,selected[0])
 
         elif action=="verify_flags":
             output=verify_flags_remote(self.target)

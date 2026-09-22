@@ -1,7 +1,7 @@
 import sys, json, time, re, logging, base64, hashlib
 from pathlib import Path
 from Crypto.Cipher import AES
-from core.state_manager import StateManager
+from core.state_manager import StateManager, save_persistent_state
 from utils.smart_executor import SmartCommandExecutor
 from utils.exploit_matcher import ExploitMatcher
 from nodes.dynamic_agent import LLMDecisionEngine, CommandSanitizer
@@ -12,6 +12,8 @@ logger=logging.getLogger("EnterpriseDynamicAgent")
 
 MAX_STEPS=200
 MAX_SAME_ACTION_ATTEMPTS=3
+MAX_PLANNER_RETRIES=2
+MAX_PLANNER_STALLS=3
 CANONICAL_SCAN="version_scan.txt"
 LEGACY_SCANS=("full_recon.txt",)
 
@@ -24,6 +26,7 @@ class EnterpriseDynamicAgent:
         self.executor=SmartCommandExecutor(timeout_minutes=20,poll_interval=15)
         self.exploit_matcher=ExploitMatcher(target_ip)
         self.autonomy=AutonomyEngine(target_ip)
+        self.recovery_index=0
 
     def extract_domain_from_scan(self,scan_content:str):
         if self.domain_name:return
@@ -119,7 +122,7 @@ class EnterpriseDynamicAgent:
 
     @staticmethod
     def action_family(command):
-        text=re.sub(r"\\s+"," ",command.lower().strip())
+        text=re.sub(r"\s+"," ",command.lower().strip())
         if any(x in text for x in ("ntpdate","timedatectl","chronyc")):
             return "ntp_time_synchronization"
         if any(x in text for x in ("psexec","wmiexec","smbexec","evil-winrm","winrm","xfreerdp","rdesktop")):
@@ -144,7 +147,7 @@ class EnterpriseDynamicAgent:
             return "credential_dump_analysis"
         if "ldapsearch" in text:
             return "ldap_query"
-        return re.sub(r"\\s+"," ",text)[:160]
+        return re.sub(r"\s+"," ",text)[:160]
 
     @staticmethod
     def action_goal(command):
@@ -178,35 +181,77 @@ class EnterpriseDynamicAgent:
         family=self.action_family(command)
         return sum(self.action_family(h.get("command",""))==family for h in history if h.get("command"))
 
+    def persist_planner_state(self,state,**updates):
+        planner_state=dict(state.get("planner_state") or {})
+        planner_state.update(updates)
+        new_state={**state,"planner_state":planner_state}
+        save_persistent_state(new_state)
+        return new_state
+
+    def recovery_action(self,state):
+        """Adquisición de evidencia sin depender del LLM."""
+        history=state.get("history",[])
+        executed={re.sub(r"\s+"," ",h.get("command","").strip()) for h in history if h.get("command")}
+        scan=self.scan_path()
+        scan_text=scan.read_text(encoding="utf-8",errors="ignore").lower() if scan.exists() else ""
+        candidates=[]
+        if "389/tcp" in scan_text or "636/tcp" in scan_text or "3268/tcp" in scan_text:
+            candidates.append((f"ldapsearch -x -H ldap://{self.target_ip} -s base namingContexts defaultNamingContext dnsHostName","recovery.ldap_rootdse"))
+        if "445/tcp" in scan_text or "139/tcp" in scan_text:
+            candidates.append((f"smbclient -L //{self.target_ip} -N","recovery.smb_shares"))
+        if "135/tcp" in scan_text:
+            candidates.append((f"rpcclient -U '' -N {self.target_ip} -c 'srvinfo'","recovery.rpc_info"))
+        for command,action_id in candidates:
+            if re.sub(r"\s+"," ",command.strip()) not in executed:
+                logger.warning("[RECOVERY] Planner estancado; adquiriendo evidencia con %s",action_id)
+                return command,"recovery",action_id
+        return None
+
     def autonomous_fallback(self,state,potential_exploit=None):
         history=state.get("history",[]); blocked=[]
         for h in history[-20:]:
             cmd=h.get("command","")
             if cmd: blocked.append(re.sub(r"\s+"," ",cmd.strip()))
-        planner=LLMDecisionEngine(); augmented_history=list(history)
+        planner=LLMDecisionEngine()
         completed=self.completed_goals(history)
+        planner_state=state.get("planner_state") or {}
+        blocked_goals=set(planner_state.get("blocked_goals",[]))
         autonomy_context=self.autonomy.context(state)
         planner_context=("No hay flag todavía. Debes continuar la auditoría. NO declares mission_complete hasta detectar una flag. "
-                         "No repitas objetivos de conocimiento ya completados con éxito; cambia de objetivo salvo que exista evidencia nueva de fallo o necesidad. "
-                         f"Objetivos ya completados/bloqueados: {json.dumps(sorted(completed))}. No repitas ninguno; cambia de objetivo y técnica. "
-                         "El LLM conserva libertad táctica para elegir el siguiente objetivo y herramienta; el supervisor solo impide repeticiones estériles, corrupción del estado y finalización sin evidencia. "
+                         "No repitas objetivos de conocimiento ya completados, bloqueados o agotados. "
+                         f"Objetivos ya completados/bloqueados: {json.dumps(sorted(set(completed)|blocked_goals))}. "
+                         "Si no puedes proponer una acción nueva, devuelve command vacío y no inventes una repetición. "
+                         "El LLM conserva libertad táctica para elegir el siguiente objetivo y herramienta; el supervisor impide repeticiones estériles. "
                          f"Estado de autonomía: {json.dumps(autonomy_context, ensure_ascii=False)}. "
-                         "Comandos ya ejecutados y que NO debes repetir exactamente: "+json.dumps(blocked)+"\\n")
+                         "Comandos ya ejecutados y que NO debes repetir exactamente: "+json.dumps(blocked)+"\n")
         if potential_exploit and potential_exploit.get("available"):
-            planner_context += ("Existe potential_exploit como metadata de candidatos. Debes validar aplicabilidad contra la evidencia antes de proponer cualquier acción; NO trates campos de SearchSploit como comandos ejecutables. Candidatos: "+json.dumps(potential_exploit,ensure_ascii=False)[:6000])
-        augmented_history.append({"step":state.get("step_count",0),"command":"[PLANNER]","output":planner_context})
-        for _ in range(3):
-            decision=planner.consult_tactical_next_step(self.target_ip,augmented_history,state.get("last_output",""),potential_exploit=potential_exploit)
-            cmd=CommandSanitizer.clean(decision.get("command",""))
-            if not cmd: continue
+            planner_context += ("Potential_exploit es SOLO metadata de candidatos y requiere validación contra evidencia; nunca lo trates como comando ejecutable. Candidatos: "+json.dumps(potential_exploit,ensure_ascii=False)[:6000])
+        augmented_history=list(history)
+        augmented_history.append({"step":state.get("step_count",0),"command":"[PLANNER_CONTEXT]","output":planner_context})
+        for _ in range(MAX_PLANNER_RETRIES):
+            try:
+                decision=planner.consult_tactical_next_step(self.target_ip,augmented_history,state.get("last_output",""),potential_exploit=potential_exploit) or {}
+            except Exception as exc:
+                logger.exception("[!] Planner exception: %s",exc)
+                break
+            cmd=CommandSanitizer.clean(str(decision.get("command","") or ""))
+            if not cmd:
+                augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_EMPTY]","output":"El planner no propuso una acción."})
+                continue
             normalized=re.sub(r"\s+"," ",cmd.strip())
             goal=self.action_goal(cmd)
-            if goal and goal in completed:
-                augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_COMPLETED_GOAL]","output":f"Objetivo semántico {goal!r} ya completado; selecciona otro objetivo."})
+            if goal and (goal in completed or goal in blocked_goals):
+                blocked_goals.add(goal)
+                augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_COMPLETED_GOAL]","output":f"Objetivo semántico {goal!r} ya completado/bloqueado."})
                 continue
-            if normalized not in blocked:return cmd,"autonomous",f"llm.{self.fingerprint(cmd)}"
-            augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_DUPLICATE]","output":f"El comando {cmd!r} ya fue ejecutado. Selecciona una técnica diferente."})
-        return None
+            if normalized in blocked:
+                augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_DUPLICATE]","output":f"Comando ya ejecutado: {cmd}"})
+                continue
+            return cmd,"autonomous",f"llm.{self.fingerprint(cmd)}"
+        logger.warning("[!] Planner agotó sus reintentos sin una acción nueva.")
+        self.persist_planner_state(state,status="STALLED",stalled_attempts=int(planner_state.get("stalled_attempts",0))+1,
+                                   blocked_goals=sorted(set(completed)|blocked_goals),last_reason="no_new_action")
+        return self.recovery_action(state)
 
     def determine_next_action(self,state):
         history=state.get("history",[]); commands=[h.get("command","") for h in history]
@@ -238,7 +283,17 @@ class EnterpriseDynamicAgent:
                 self.state_manager.mark_complete("flag_found:"+flags[0],self.current_step); logger.info("[+] FLAG DETECTADA: %s",flags[0]); return
             command,phase,action_id=self.determine_next_action(state)
             if not command:
-                logger.warning("[!] Planner sin acción nueva; se reintentará con contexto actualizado."); time.sleep(2); continue
+                planner_state=state.get("planner_state") or {}
+                stalls=int(planner_state.get("stalled_attempts",0))
+                if stalls >= MAX_PLANNER_STALLS:
+                    logger.error("[!] Planner agotado tras %d bloqueos; se detiene el ciclo.",stalls)
+                    self.persist_planner_state(state,status="EXHAUSTED",stalled_attempts=stalls,last_reason="planner_exhausted")
+                    return
+                logger.warning("[!] Planner sin acción nueva; se conserva el estado y se intenta recuperación.")
+                self.persist_planner_state(state,status="STALLED",stalled_attempts=stalls+1,last_reason="no_action")
+                time.sleep(min(2*(stalls+1),6))
+                self.current_step+=1
+                continue
             attempts=state.get("action_attempts",{}).get(action_id,0); recent=state.get("history",[]); fp=self.fingerprint(command)
             repeats=sum(self.fingerprint(h.get("command",""))==fp for h in recent[-6:])
             semantic_repeats=self.semantic_repeats(recent,command)
@@ -265,7 +320,7 @@ class EnterpriseDynamicAgent:
             if result.get("stderr"):output+="\nSTDERR:\n"+result["stderr"]
             entry={"step":self.current_step,"action_id":action_id,"command":command,"output":output[:8000],"status":result.get("status"),"returncode":result.get("returncode")}
             autonomy_update=self.autonomy.observe(state, entry)
-            self.state_manager.save_state(self.current_step,entry,phase,False,extra={"last_action_id":action_id,"last_command_fingerprint":fp,"action_attempts":{**state.get("action_attempts",{}),action_id:attempts+1},"potential_exploit":getattr(self,"current_potential_exploit",{"available":False,"candidate_count":0,"candidates":[]}),"autonomy":autonomy_update})
+            self.state_manager.save_state(self.current_step,entry,phase,False,extra={"last_action_id":action_id,"last_command_fingerprint":fp,"action_attempts":{**state.get("action_attempts",{}),action_id:attempts+1},"potential_exploit":getattr(self,"current_potential_exploit",{"available":False,"candidate_count":0,"candidates":[]}),"autonomy":autonomy_update,"planner_state":{"status":"PROGRESS","stalled_attempts":0,"blocked_goals":list((state.get("planner_state") or {}).get("blocked_goals",[])),"last_reason":"action_executed"}})
             self.current_step+=1; time.sleep(1)
         logger.warning("[!] Límite de seguridad de %d pasos alcanzado sin flag; la misión NO se marca como completada.",MAX_STEPS)
 

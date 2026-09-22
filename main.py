@@ -1,187 +1,143 @@
-#!/usr/bin/env python3
-"""Automatic authorized-lab agent: python3 main.py 10.129.x.x"""
-from __future__ import annotations
-
-import argparse
-import json
-import logging
-import re
 import sys
+import json
 import time
+import re
+import logging
 from pathlib import Path
 
-from core.flags import extract_flags, mission_status
-from core.intel import merge_intel, parse_loot_files, parse_output, persist_intel
-from core.playbook import LabPlaybook
-from core.policy_engine import evaluate_policy
-from core.state_manager import StateManager
-from utils.exploit_matcher import ExploitMatcher
-from utils.smart_executor import SmartCommandExecutor
-
-DOMAIN_RE = re.compile(r"(\b[a-zA-Z0-9-]+\.(?:htb|lab|local|lan|internal)\b)", re.I)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 logger = logging.getLogger("EnterpriseDynamicAgent")
 
+from core.state_manager import StateManager
+from utils.smart_executor import SmartCommandExecutor
+from utils.exploit_matcher import ExploitMatcher
 
-def setup_logging(log_file: Path) -> None:
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(log_file, encoding="utf-8"),
-        ],
-    )
+class EnterpriseDynamicAgent:
+    def __init__(self, target_ip: str, domain_name: str = None):
+        self.target_ip = target_ip
+        self.domain_name = domain_name
+        self.state_manager = StateManager(target_ip)
+        previous_state = self.state_manager.load_state()
+        self.current_step = previous_state.get("step_count", 0) + 1
+        logger.info(f"[*] [Agente Dinámico] Reanudando sesión para {target_ip}. Paso actual: {self.current_step}")
+        self.executor = SmartCommandExecutor(timeout_minutes=20, poll_interval=15)
+        self.exploit_matcher = ExploitMatcher(target_ip)
 
+    def check_flags_status(self) -> tuple:
+        state = self.state_manager.load_state()
+        history = state.get("history", [])
+        user_found = False
+        root_found = False
+        for h in history:
+            output = h.get("output", "")
+            cmd = h.get("command", "")
+            if "user.txt" in output or "user.txt" in cmd:
+                if len(output.strip()) > 10 and not "No such file" in output:
+                    user_found = True
+            if "root.txt" in output or "root.txt" in cmd:
+                if len(output.strip()) > 10 and not "No such file" in output:
+                    root_found = True
+        return user_found, root_found
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("ip", help="Target IP in lab range")
-    p.add_argument("--max-steps", type=int, default=25)
-    return p.parse_args()
+    def extract_domain_from_scan(self, scan_content: str):
+        if self.domain_name:
+            return
+        match = re.search(r"(\b[a-zA-Z0-9-]+\.(?:local|htb|lan|internal|com|org|net)\b)", scan_content, re.IGNORECASE)
+        if match:
+            self.domain_name = match.group(1).lower()
+            logger.info(f"[+] [Auto-Descubrimiento] Dominio detectado automáticamente: {self.domain_name}")
+            self.state_manager.update_etc_hosts(domain_name=self.domain_name)
+        else:
+            self.domain_name = f"target-{self.target_ip.replace('.', '-')}.local"
+            logger.warning(f"[!] No se pudo extraer un FQDN claro. Usando dominio genérico: {self.domain_name}")
 
+    def determine_next_action(self, current_state: dict) -> tuple:
+        history = current_state.get("history", [])
+        executed_commands = [h.get("command", "") for h in history]
+        scan_path = f"testing/{self.target_ip}/scans/version_scan.txt"
+        if not any("nmap" in cmd for cmd in executed_commands):
+            command = f"nmap -sV -sC -p- -oN {scan_path} {self.target_ip}"
+            return command, "recon"
 
-def inject_domain(domain: str | None, command: str) -> str:
-    if not domain:
-        return command.replace(" -d detected.htb", "").replace("detected.htb/", "/")
-    parts = domain.split(".")
-    dc = ",".join(f"DC={p}" for p in parts)
-    return command.replace("detected.htb", domain).replace("DC=detected,DC=htb", dc)
+        scan_content = ""
+        if Path(scan_path).exists():
+            with open(scan_path, "r", encoding="utf-8") as f:
+                scan_content = f.read()
+            self.extract_domain_from_scan(scan_content)
 
+        is_active_directory = "88/tcp" in scan_content or "389/tcp" in scan_content
 
-def write_flags(loot: Path, status: dict) -> None:
-    if status.get("user_flags"):
-        (loot / "user.flag").write_text(status["user_flags"][0] + "\n")
-    if status.get("root_flags"):
-        (loot / "root.flag").write_text(status["root_flags"][0] + "\n")
-    if status.get("user_flags") or status.get("root_flags"):
-        (loot / "flags.json").write_text(
-            json.dumps(
-                {"user": status.get("user_flags", []), "root": status.get("root_flags", [])},
-                indent=2,
-            )
-        )
+        if is_active_directory:
+            domain = self.domain_name
+            if not any("kerbrute" in cmd for cmd in executed_commands):
+                wordlist = "/usr/share/seclists/Usernames/Names/names.txt"
+                if not Path(wordlist).exists():
+                    wordlist = "/usr/share/wordlists/rockyou.txt"
+                command = f"kerbrute userenum -d {domain} --dc {self.target_ip} {wordlist}"
+                return command, "enumeration"
+            if not any("GetNPUsers.py" in cmd for cmd in executed_commands):
+                loot_path = f"testing/{self.target_ip}/loot/asrep_hashes.txt"
+                command = f"GetNPUsers.py {domain}/ -no-pass -dc-ip {self.target_ip} -outputfile {loot_path}"
+                return command, "exploitation"
+            if not any("smbclient" in cmd for cmd in executed_commands):
+                command = f"smbclient -N -L //{self.target_ip}"
+                return command, "enumeration"
+            if not any("rpcclient" in cmd for cmd in executed_commands):
+                command = f"rpcclient -U '' -N {self.target_ip} -c 'enumdomusers'"
+                return command, "enumeration"
+        else:
+            if "80/tcp open" in scan_content or "443/tcp open" in scan_content:
+                if not any("gobuster" in cmd for cmd in executed_commands):
+                    wordlist = "/usr/share/wordlists/dirb/common.txt"
+                    command = f"gobuster dir -u http://{self.target_ip} -w {wordlist} -t 50"
+                    return command, "enumeration"
 
+        step_count = len(executed_commands)
+        command = f"echo '[*] Ciclo adaptativo #{step_count}: Analizando vectores alternativos para {self.target_ip}'"
+        return command, "post-exploitation"
 
-def maybe_match_cves(target: str, scans_dir: Path, loot: Path) -> None:
-    report = loot / "potential_exploits.json"
-    scan = scans_dir / "version_scan.txt"
-    if report.exists() or not scan.exists():
-        return
-    text = scan.read_text(errors="ignore")
-    if "open" not in text:
-        return
-    hits = ExploitMatcher(target).analyze_scan_output(text)
-    logger.info("[+] CVE candidates services=%s", list(hits.keys()))
-
-
-def main():
-    args = parse_args()
-    target = args.ip
-    if not evaluate_policy(target):
-        print("[-] IP fuera de alcance HTB/lab", file=sys.stderr)
-        sys.exit(3)
-
-    sm = StateManager(target)
-    setup_logging(sm.state_dir / "agent.log")
-    state = sm.load_state()
-    playbook = LabPlaybook(target, sm.state_dir)
-    executor = SmartCommandExecutor(timeout_minutes=6, poll_interval=10)
-    step = state.get("step_count", 0)
-
-    logger.info("AUTO start target=%s logs=%s", target, sm.state_dir / "agent.log")
-
-    while step < args.max_steps:
-        intel = merge_intel(state, parse_loot_files(sm.loot_dir))
-        state.update(intel)
-        persist_intel(sm.loot_dir, intel)
-        maybe_match_cves(target, sm.scans_dir, sm.loot_dir)
-
-        status = mission_status([h.get("output", "") for h in state.get("history", [])], sm.loot_dir)
-        write_flags(sm.loot_dir, status)
-        if status["complete"]:
-            logger.info("[+] DONE user=%s root=%s", status["user_flags"], status["root_flags"])
-            sm.save_state(step, {"command": "stop", "output": "flags"}, "done", True, credentials=intel["credentials"], extra=status)
-            break
-
-        cmd, phase = playbook.next_action(state)
-        if cmd == "__STOP__" or phase == "stop":
-            logger.info("[*] playbook finished (no more steps). not a crash.")
-            break
-
-        cmd = inject_domain(state.get("domain"), cmd)
-        if cmd.strip().startswith("echo ") and "osticket_probe" not in cmd and "LFI" not in cmd:
-            logger.info("[*] skip echo noop -> next")
-            sm.save_state(step, {"command": cmd, "output": "skipped"}, phase, False)
-            state = sm.load_state()
-            continue
-
-        step += 1
-        logger.info("[*] %s [%s] %s", step, phase, cmd)
-
-        result = executor.execute_with_polling(cmd)
-        st = result.get("status") or "completed"
-        if st == "timeout_killed":
-            logger.warning("[*] timeout on step %s — saving output and CONTINUING", step)
-        output = (result.get("stdout") or "") + "\n" + (result.get("stderr") or "")
-        (sm.state_dir / "logs").mkdir(exist_ok=True)
-        (sm.state_dir / "logs" / f"step_{step:02d}.log").write_text(output, encoding="utf-8")
-
-        scan = ""
-        for n in ("version_scan.txt", "quick_scan.txt"):
-            p = sm.scans_dir / n
-            if p.exists():
-                scan = p.read_text(errors="ignore")
+    def run_autonomous_loop(self):
+        logger.info("==================================================")
+        logger.info(f"[*] [Iniciando Agente Autónomo Dinámico] Objetivo: {self.target_ip}")
+        logger.info("[*] El agente iterará de forma autónoma hasta capturar las flags.")
+        logger.info("==================================================")
+        while True:
+            logger.info(f"\n==================================================")
+            logger.info(f"[*] [Agente Autónomo - Paso Global #{self.current_step}] Evaluando entorno...")
+            logger.info(f"==================================================")
+            user_ok, root_ok = self.check_flags_status()
+            if user_ok and root_ok:
+                logger.info("[+] MISIÓN CUMPLIDA user+root")
                 break
-        m = DOMAIN_RE.search(scan) or DOMAIN_RE.search(output)
-        if m and not state.get("domain"):
-            state["domain"] = m.group(1).lower()
-            sm.update_etc_hosts(state["domain"])
-            logger.info("[+] domain %s", state["domain"])
-
-        maybe_match_cves(target, sm.scans_dir, sm.loot_dir)
-
-        intel = merge_intel(state, parse_output(output), parse_loot_files(sm.loot_dir))
-        state.update(intel)
-        persist_intel(sm.loot_dir, intel)
-        if intel["credentials"]:
-            logger.info("[+] creds saved: %s", [c.get("username") for c in intel["credentials"]])
-
-        flags = extract_flags(output)
-        if flags:
-            (sm.loot_dir / f"flags_step_{step}.txt").write_text("\n".join(flags) + "\n")
-
-        status = mission_status(
-            [h.get("output", "") for h in state.get("history", [])] + [output],
-            sm.loot_dir,
-        )
-        write_flags(sm.loot_dir, status)
-        sm.save_state(
-            step,
-            {
-                "step": step,
-                "command": cmd,
-                "output": output[-8000:],
-                "phase": phase,
-                "exec_status": st,
-            },
-            phase=phase,
-            mission_complete=status["complete"],
-            credentials=intel["credentials"],
-            extra={
-                "domain": state.get("domain"),
-                "users": intel["users"],
-                "passwords": intel["passwords"],
-                **status,
-            },
-        )
-        state = sm.load_state()
-        if status["complete"]:
-            logger.info("[+] flags user=%s root=%s", status["user_flags"], status["root_flags"])
-            break
-        logger.info("[*] step %s done (%s) -> next", step, st)
-        time.sleep(1)
-
+            current_state = self.state_manager.load_state()
+            command, phase = self.determine_next_action(current_state)
+            logger.info(f"[*] [Motor Decisión] Ejecutando: {command}")
+            exec_result = self.executor.execute_with_polling(command)
+            output = exec_result.get("stdout", "")
+            scan_path = f"testing/{self.target_ip}/scans/version_scan.txt"
+            if "nmap" in command and Path(scan_path).exists():
+                with open(scan_path, "r", encoding="utf-8") as f:
+                    scan_content = f.read()
+                self.exploit_matcher.analyze_scan_output(scan_content)
+            history_entry = {"step": self.current_step, "command": command, "output": output}
+            self.state_manager.save_state(
+                step=self.current_step,
+                history_entry=history_entry,
+                phase=phase,
+                mission_complete=(user_ok and root_ok)
+            )
+            self.current_step += 1
+            time.sleep(3)
+        logger.info("[+] [Agente] Operación finalizada.")
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1:
+        TARGET_IP = sys.argv[1]
+    else:
+        TARGET_IP = "10.129.9.175"
+    agent = EnterpriseDynamicAgent(target_ip=TARGET_IP)
+    agent.run_autonomous_loop()

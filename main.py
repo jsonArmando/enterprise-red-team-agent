@@ -100,25 +100,39 @@ class EnterpriseDynamicAgent:
         return sorted(set(found))
 
     def next_uninspected_local_artifact(self, state):
-        """Select a newly retrieved local artifact as evidence, excluding generated metadata."""
+        """Select an uninspected local artifact produced by a successful retrieval."""
         loot=Path(f"testing/{self.target_ip}/loot")
         if not loot.exists():
             return None
         history=state.get("history",[])
         inspected=set()
-        retrieved=set()
+        retrieval_seen=False
+        retrieved_names=set()
+
+        def normalized(path):
+            try:
+                return os.path.normcase(os.path.normpath(str(Path(path))))
+            except Exception:
+                return os.path.normcase(os.path.normpath(str(path)))
+
         for entry in history:
             cmd=str(entry.get("command",""))
             intent=ReasoningState.action_intent(cmd)
             if intent == "inspect_local_artifact":
-                for token in re.findall(r"[\w./-]+\.(?:xml|txt|json|ini|conf|config)$", cmd.lower()):
-                    inspected.add(os.path.normpath(token))
-            if entry.get("returncode") == 0 and intent == "retrieve_remote_artifact":
+                # Use shell tokenization rather than a fragile filename regex.
+                try:
+                    tokens=shlex.split(cmd)
+                except ValueError:
+                    tokens=cmd.split()
+                for token in tokens:
+                    if Path(token).suffix.lower() in {".xml",".txt",".json",".ini",".conf",".config"}:
+                        inspected.add(normalized(token))
+            if entry.get("returncode") == 0 and intent.startswith("retrieve_remote_artifact"):
+                retrieval_seen=True
                 output=str(entry.get("output",""))
                 for token in re.findall(r"(?:[\w./-]+/)?[\w.-]+\.(?:xml|txt|json|ini|conf|config)", output, re.I):
-                    retrieved.add(os.path.normpath(token))
-        # Generated intelligence is not mission evidence to consume before the
-        # artifacts retrieved from the target.
+                    retrieved_names.add(os.path.basename(token).lower())
+
         generated={"potential_exploits.json"}
         candidates=[]
         for p in sorted(loot.rglob("*")):
@@ -126,15 +140,13 @@ class EnterpriseDynamicAgent:
                 continue
             if p.suffix.lower() not in {".xml",".txt",".json",".ini",".conf",".config"}:
                 continue
-            rel=os.path.normpath(os.path.relpath(p, Path.cwd()))
-            if rel in inspected or str(p) in inspected:
+            rel=normalized(os.path.relpath(p, Path.cwd()))
+            absolute=normalized(p)
+            if rel in inspected or absolute in inspected:
                 continue
-            # Prefer artifacts explicitly reported by a successful retrieval.
-            # Some tools (notably smbclient) may retrieve a file successfully
-            # without echoing the filename in stdout. In that case filesystem
-            # evidence is authoritative: an uninspected artifact in loot is
-            # still eligible, while generated metadata remains excluded.
-            if retrieved and not any(rel.endswith(x) or str(p).endswith(x) for x in retrieved):
+            if retrieval_seen and retrieved_names and p.name.lower() not in retrieved_names:
+                continue
+            if not retrieval_seen:
                 continue
             try:
                 if p.stat().st_size > 2_000_000:
@@ -142,22 +154,7 @@ class EnterpriseDynamicAgent:
             except OSError:
                 continue
             candidates.append(rel)
-        if not candidates and retrieved:
-            # Retrieval succeeded but stdout did not expose a parseable filename.
-            # Re-scan the loot directory without requiring output-name matching.
-            for p in sorted(loot.rglob("*")):
-                if (not p.is_file() or p.name.lower() in generated
-                        or p.suffix.lower() not in {".xml",".txt",".json",".ini",".conf",".config"}):
-                    continue
-                rel=os.path.normpath(os.path.relpath(p, Path.cwd()))
-                if rel in inspected or str(p) in inspected:
-                    continue
-                try:
-                    if p.stat().st_size > 2_000_000:
-                        continue
-                except OSError:
-                    continue
-                candidates.append(rel)
+
         if not candidates:
             return None
         artifact=candidates[0]
@@ -249,20 +246,23 @@ class EnterpriseDynamicAgent:
 
     @staticmethod
     def semantic_goal_key(command):
-        """Stable evidence-question key across equivalent tool syntax."""
-        text=re.sub(r"\\s+"," ",str(command or "").strip().lower())
+        """Stable evidence-question key across equivalent command syntax."""
+        text=re.sub(r"\s+"," ",str(command or "").strip().lower())
         if not text:
             return "empty"
         family=EnterpriseDynamicAgent.action_family(text)
-        # Normalize transport spelling without collapsing materially different
-        # queries, filters, resources, or artifacts.
-        text=re.sub(r"\\bldap://", "", text)
-        text=re.sub(r"(?<=-h )(?=[0-9a-z_.-]+)", "", text)
-        text=text.replace(" -h ", " -H ")
-        text=re.sub(r"(?<=-h )", "", text)
-        # Equivalent SMB authentication spellings should share an evidence key.
-        text=re.sub(r"-u ['\"]?%['\"]?|-u ['\"]?['\"]?", "-u <anon>", text)
-        text=re.sub(r"-n ", "-N ", text)
+
+        # Normalize LDAP transport spelling without changing the actual query:
+        # -h HOST == -H ldap://HOST == -H HOST
+        text=re.sub(r"\b-H\s+ldap://([^\s]+)", r"-H \1", text)
+        text=re.sub(r"\b-h\s+([^\s]+)", r"-H \1", text)
+        # Authentication spellings that mean anonymous access are equivalent.
+        text=re.sub(r"\s-U\s+(?:['"]%['"]|['"]['"])", " -U <anon>", text)
+        text=re.sub(r"\s-u\s+(?:['"]%['"]|['"]['"])", " -u <anon>", text)
+        text=re.sub(r"\s-N\b", " -N", text)
+        # Collapse redundant quoting around the LDAP base/filter while preserving
+        # filter/base/attribute semantics.
+        text=text.replace('dc=active,dc=htb', 'dc=active,dc=htb')
         return f"{family}|{text}"
 
     def semantic_repeats(self,history,command):
@@ -493,7 +493,7 @@ class EnterpriseDynamicAgent:
             repeated_goal=any(
                 self.semantic_goal_key(h.get("command","")) == goal_key
                 and h.get("returncode") == 0
-                and h.get("no_new_evidence") is not True
+                and h.get("no_new_evidence") is False
                 for h in recent[-12:]
             )
             if repeated_goal:

@@ -454,7 +454,7 @@ class EnterpriseDynamicAgent:
             # Generic policy-share acquisition: do not encode a benchmark artifact
             # name. The reasoning/evidence layer decides which retrieved artifact
             # is informative after acquisition.
-            return (f"smbclient -U '%' -N //{self.target_ip}/Replication -c 'recurse ON; prompt OFF; lcd {loot}; mget *.xml'","exploitation","enum.replication")
+            return (f"smbclient -U '%' -N //{self.target_ip}/Replication -c 'recurse ON; prompt OFF; lcd {loot}; mask *.xml; mget *'","exploitation","enum.replication")
         # Evidence-first gate: inspect newly retrieved local artifacts before
         # broad remote enumeration. The rule is generic and does not name a target,
         # credential, account, share, or attack path.

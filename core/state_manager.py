@@ -34,7 +34,7 @@ class StateManager:
     def load_state(self):
         if self.state_file.exists():
             try:
-                d=json.loads(self.state_file.read_text(encoding="utf-8"))
+                d=redact_secrets(json.loads(self.state_file.read_text(encoding="utf-8")))
                 d.setdefault("history",[]); d.setdefault("completed_actions",[]); d.setdefault("action_attempts",{}); d.setdefault("mission_complete",False)
                 d.setdefault("planner_state",{"status":"READY","stalled_attempts":0,"blocked_goals":[],"blocked_actions":[],"recovery_attempts":[],"last_reason":"","no_progress_streak":0})
                 return d

@@ -122,10 +122,11 @@ class EnterpriseDynamicAgent:
         try:
             data=json.loads(output)
             if isinstance(data,dict):
+                privilege=str(data.get("privilege_level") or data.get("user") or "").lower()
                 return bool(
                     data.get("success") or data.get("access_obtained") or
                     data.get("session_established") or data.get("root_obtained") or
-                    data.get("verified")
+                    data.get("verified") or data.get("uid")==0 or privilege in {"root","system"}
                 )
         except Exception:
             pass

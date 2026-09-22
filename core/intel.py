@@ -7,12 +7,13 @@ from pathlib import Path
 
 USER_LINE = re.compile(r"VALID USERNAME:\s+(\S+)@", re.I)
 NXC_OK = re.compile(r"\[\+\]\s+([^\\\s]+)\\([^:\s]+):(\S+)")
+GPP_USER = re.compile(r"(?:GPP_)?User(?:name)?\s*[:=]\s*([A-Za-z0-9._$-]{2,64})", re.I)
+GPP_PASS = re.compile(r"(?:GPP_)?(?:Password|cpassword decrypted)\s*[:=]\s*(\S{4,80})", re.I)
 USER_TOKEN = re.compile(r"\b(?:user(?:name)?|account)[:\s]+([A-Za-z0-9._-]{2,32})", re.I)
-PASS_TOKEN = re.compile(
-    r"\b(?:password|passwd|pwd)[:\s]+(\S{4,64})", re.I
-)
+PASS_TOKEN = re.compile(r"\b(?:password|passwd|pwd)[:\s]+(\S{4,64})", re.I)
 XML_PASS = re.compile(r"<t[^>]*>([^<]{6,64})</t>")
-HEX32 = re.compile(r"\b([a-fA-F0-9]{32})\b")
+XML_USER = re.compile(r'userName="([^"]+)"', re.I)
+XML_CPASS = re.compile(r'cpassword="([^"]+)"', re.I)
 
 
 def _uniq(items: list[str]) -> list[str]:
@@ -36,17 +37,18 @@ def parse_output(text: str) -> dict:
         creds.append({"username": m.group(2), "password": m.group(3), "domain": m.group(1), "source": "nxc"})
         users.append(m.group(2))
         passwords.append(m.group(3))
+    gu, gp = GPP_USER.findall(text), GPP_PASS.findall(text)
+    users += gu
+    passwords += [p for p in gp if p.lower() not in {"null", "none", "true", "false", "found"}]
+    if gu and gp:
+        creds.append({"username": gu[0], "password": gp[0], "source": "gpp"})
     for m in USER_TOKEN.finditer(text):
         users.append(m.group(1))
     for m in PASS_TOKEN.finditer(text):
         p = m.group(1)
         if p.lower() not in {"null", "none", "true", "false"}:
             passwords.append(p)
-    return {
-        "users": _uniq(users),
-        "passwords": _uniq(passwords),
-        "creds": creds,
-    }
+    return {"users": _uniq(users), "passwords": _uniq(passwords), "creds": creds}
 
 
 def parse_loot_files(loot: Path) -> dict:
@@ -66,16 +68,11 @@ def parse_loot_files(loot: Path) -> dict:
         users += chunk["users"]
         passwords += chunk["passwords"]
         creds += chunk["creds"]
-        if path.suffix.lower() in {".xml", ".xlsx", ".txt", ".csv", ".json"}:
-            for m in XML_PASS.finditer(data):
-                val = m.group(1)
-                if any(c.isdigit() for c in val) and any(c.isalpha() for c in val) and " " not in val:
-                    passwords.append(val)
-    return {
-        "users": _uniq(users),
-        "passwords": _uniq(passwords),
-        "creds": creds,
-    }
+        if path.suffix.lower() == ".xml":
+            users += XML_USER.findall(data)
+            if XML_CPASS.search(data):
+                passwords.append("GPP_CPASSWORD_PRESENT")
+    return {"users": _uniq(users), "passwords": _uniq(passwords), "creds": creds}
 
 
 def merge_intel(state: dict, *chunks: dict) -> dict:

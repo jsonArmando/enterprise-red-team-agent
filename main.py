@@ -199,6 +199,8 @@ class EnterpriseDynamicAgent:
         executed={re.sub(r"\s+"," ",h.get("command","").strip()) for h in history if h.get("command")}
         planner_state=state.get("planner_state") or {}
         attempted=set(planner_state.get("recovery_attempts",[]))
+        blocked_goals=set(planner_state.get("blocked_goals",[]))
+        completed_goals=self.completed_goals(history)
         scan=self.scan_path()
         scan_text=scan.read_text(encoding="utf-8",errors="ignore").lower() if scan.exists() else ""
         candidates=[]
@@ -210,6 +212,11 @@ class EnterpriseDynamicAgent:
             candidates.append((f"rpcclient -U '' -N {self.target_ip} -c 'srvinfo'","recovery.rpc_info"))
         for command,action_id in candidates:
             normalized=re.sub(r"\s+"," ",command.strip())
+            goal=self.action_goal(command)
+            if goal and (goal in completed_goals or goal in blocked_goals):
+                logger.info("[RECOVERY] %s omitido: objetivo %s ya completado/bloqueado.",action_id,goal)
+                attempted.add(action_id)
+                continue
             if action_id in attempted or normalized in executed:
                 continue
             new_planner_state={**planner_state,"status":"RECOVERY","recovery_attempts":sorted(attempted|{action_id}),"last_reason":action_id}

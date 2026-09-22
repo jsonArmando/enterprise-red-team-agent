@@ -179,6 +179,7 @@ class LLMDecisionEngine:
             "{\n"
             '  "thought": "Análisis táctico detallado justificando el siguiente paso técnico",\n'
             '  "command": "Comando exacto de Kali Linux a ejecutar sin comentarios",\n'
+            '  "hypothesis_id": "ID de la hipótesis que esta acción prueba",\n'
             '  "mission_complete": False\n'
             "}"
             "Regla crítica: los candidatos de potential_exploit requieren validación contra la evidencia; no los trates como comandos por sí mismos.\n"
@@ -195,6 +196,7 @@ class LLMDecisionEngine:
             f"Acciones bloqueadas recientemente: {json.dumps(blocked, ensure_ascii=False)}\n\n"
             f"Última salida obtenida de Kali Linux (truncada si es muy extensa):\n{last_output[:3000]}\n\n"
             f"Modelo del mundo (fuente principal para decidir):\n{json.dumps(reasoning_context, indent=2, ensure_ascii=False)}\n\n"
+            "El controlador de hipótesis es obligatorio: respeta control_signal e hypothesis_control. Si exige switch_hypothesis, cambia de hipótesis y devuelve hypothesis_id.\n\n"
             f"Potential exploit (SOLO metadata/candidatos; nunca asumir que sus campos son comandos ejecutables):\n{potential_context}"
         )
 

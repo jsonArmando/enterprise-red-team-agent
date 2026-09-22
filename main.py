@@ -185,7 +185,7 @@ class EnterpriseDynamicAgent:
             allowed={x.get("name") for x in state.get("kali_tools",[]) if x.get("name")}
             if tool not in allowed:
                 return state,{"event_type":"blocked","action":action,"reason":"tool_not_in_discovered_kali_catalog"}
-            output=run_shell_tool(tool,args,timeout=int(decision.get("timeout",900)))
+            output=run_shell_tool(tool,args,timeout=int(decision.get("timeout",900)),catalogued_tools=allowed)
 
         elif action=="cve_lookup":
             c=self.candidate(state,cid)

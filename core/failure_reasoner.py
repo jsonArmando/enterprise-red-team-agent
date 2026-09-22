@@ -61,6 +61,8 @@ class FailureReasoner:
             result = json.loads(raw)
             if result.get("recovery_action") not in RECOVERY_ACTIONS:
                 return fallback
+            if result.get("recovery_action") == failure.get("action") and not failure.get("new_evidence_available"):
+                return fallback
             result["failure_id"] = failure.get("id")
             return result
         except Exception:
@@ -73,8 +75,10 @@ class FailureReasoner:
             next_action = "recon"
         elif action in {"exploit_candidate", "validate_candidate"}:
             next_action = "replan"
-        elif action in {"establish_access", "reverse_shell"}:
-            next_action = "session_enum" if any(x in output for x in ("uid=", "session_established")) else "reverse_shell"
+        elif action == "establish_access":
+            next_action = "reverse_shell"
+        elif action == "reverse_shell":
+            next_action = "replan"
         elif action == "privilege_escalation":
             next_action = "analyze_privesc"
         else:

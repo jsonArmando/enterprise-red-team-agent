@@ -359,6 +359,21 @@ class EnterpriseDynamicAgent:
                 logger.warning("[!] Acción repetida bloqueada: %s. Se fuerza replanning autónomo.",action_id)
                 state.setdefault("history",[]).append({"step":self.current_step,"command":"[BLOCKED_DUPLICATE]","output":f"Acción bloqueada: {command}"})
                 self.state_manager.save_state(self.current_step,state["history"][-1],"autonomous",False); self.current_step+=1; continue
+
+            # Bloqueo semántico: distintas implementaciones que intentan la misma
+            # transformación no cuentan como acciones nuevas cuando la ejecución
+            # anterior no produjo evidencia nueva.
+            action_intent=ReasoningState.action_intent(command)
+            semantic_repeat=any(
+                h.get("action_intent")==action_intent and h.get("no_new_evidence") is True
+                for h in recent
+            )
+            if semantic_repeat:
+                logger.warning("[!] Acción semánticamente repetida sin evidencia nueva: %s",action_intent)
+                blocked_entry={"step":self.current_step,"command":"[BLOCKED_SEMANTIC_REPEAT]","output":f"Intent bloqueado: {action_intent}","action_intent":action_intent}
+                self.state_manager.save_state(self.current_step,blocked_entry,"autonomous",False)
+                self.current_step+=1
+                continue
             step_limit = str(MAX_STEPS) if MAX_STEPS is not None else "∞"
             logger.info("[*] Paso %d/%s | %s | %s",self.current_step,step_limit,action_id,redact_secrets(command))
             if not CommandSanitizer.validate_command_safety(command):
@@ -367,8 +382,11 @@ class EnterpriseDynamicAgent:
                 return
             result=self.executor.execute_with_polling(command); output=result.get("stdout","")
             if result.get("stderr"):output+="\nSTDERR:\n"+result["stderr"]
-            raw_entry={"step":self.current_step,"action_id":action_id,"command":command,"output":output[:8000],"status":result.get("status"),"returncode":result.get("returncode")}
+            output_digest=hashlib.sha256(re.sub(r"\s+"," ",output).encode("utf-8",errors="ignore")).hexdigest()[:16] if output else ""
+            action_intent=ReasoningState.action_intent(command)
+            raw_entry={"step":self.current_step,"action_id":action_id,"action_intent":action_intent,"command":command,"output":output[:8000],"output_digest":output_digest,"status":result.get("status"),"returncode":result.get("returncode")}
             autonomy_update=self.autonomy.observe(state, raw_entry)
+            raw_entry["no_new_evidence"]=not bool(autonomy_update.get("last_progress"))
             reasoning_update=self.reasoning.update(output, state.get("history",[]) + [raw_entry])
             persisted_entry=redact_secrets(raw_entry)
             previous_planner_state=dict(state.get("planner_state") or {})

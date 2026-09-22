@@ -134,7 +134,8 @@ class EnterpriseDynamicAgent:
         before=self._world(state); r=self.executor.execute_with_polling(d["command"]); output=r.get("stdout","")
         if r.get("stderr"): output+="\nSTDERR:\n"+r["stderr"]
         provisional={"event_type":"action","step":self.current_step,"action_class":d.get("action_class","unspecified"),"goal_id":d.get("goal_id",""),"hypothesis_id":d.get("hypothesis_id",""),"evidence_question":d.get("evidence_question",""),"resource":d.get("resource",""),"command":d["command"],"output":output[:8000],"returncode":r.get("returncode"),"status":r.get("status")}
-        after=self._world({**state,"history":list(state.get("history",[]))+[provisional]})
+        after_reasoning=self.reasoning.update(output,state.get("history",[])+[provisional])
+        after={"facts":after_reasoning.get("facts",[]),"capabilities":after_reasoning.get("capabilities",[]),"hypotheses":after_reasoning.get("hypotheses",[])}
         oldf={str(x).lower() for x in before.get("facts",[])}; newf={str(x).lower() for x in after.get("facts",[])}; oldc={str(x).lower() for x in before.get("capabilities",[])}; newc={str(x).lower() for x in after.get("capabilities",[])}
         oldh={h.get("id"):h.get("confidence") for h in before.get("hypotheses",[]) if h.get("id")}; conf=0.0
         for h in after.get("hypotheses",[]):

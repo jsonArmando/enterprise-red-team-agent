@@ -111,11 +111,11 @@ class EnterpriseDynamicAgent:
             cmd=str(entry.get("command",""))
             intent=ReasoningState.action_intent(cmd)
             if intent == "inspect_local_artifact":
-                for token in re.findall(r"[\\w./-]+\\.(?:xml|txt|json|ini|conf|config)$", cmd.lower()):
+                for token in re.findall(r"[\w./-]+\.(?:xml|txt|json|ini|conf|config)$", cmd.lower()):
                     inspected.add(os.path.normpath(token))
             if entry.get("returncode") == 0 and intent == "retrieve_remote_artifact":
                 output=str(entry.get("output",""))
-                for token in re.findall(r"(?:[\\w./-]+/)?[\\w.-]+\\.(?:xml|txt|json|ini|conf|config)", output, re.I):
+                for token in re.findall(r"(?:[\w./-]+/)?[\w.-]+\.(?:xml|txt|json|ini|conf|config)", output, re.I):
                     retrieved.add(os.path.normpath(token))
         # Generated intelligence is not mission evidence to consume before the
         # artifacts retrieved from the target.
@@ -398,7 +398,7 @@ class EnterpriseDynamicAgent:
         # credential, account, share, or attack path.
         artifact_action=self.next_uninspected_local_artifact(state)
         if artifact_action:
-            return artifact_action,"evidence","artifact.inspect"
+            return artifact_action,"evidence",f"artifact.inspect.{self.fingerprint(artifact_action)}"
 
         # Las nuevas credenciales/capacidades ya no disparan una receta fija.
         # Se entregan al modelo del mundo y al razonador para que determine qué

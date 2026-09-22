@@ -15,7 +15,7 @@ MAX_STEPS=None  # Sin límite de pasos; la misión termina al detectar flag o po
 MAX_SAME_ACTION_ATTEMPTS=3
 MAX_PLANNER_RETRIES=2
 MAX_PLANNER_STALLS=3
-MAX_NO_PROGRESS_STREAK=5
+MAX_NO_PROGRESS_STREAK=500
 CANONICAL_SCAN="version_scan.txt"
 LEGACY_SCANS=("full_recon.txt",)
 
@@ -193,14 +193,53 @@ class EnterpriseDynamicAgent:
         save_persistent_state(new_state)
         return new_state
 
+    def tactical_fallback(self,state):
+        """Plan táctico determinista para que el agente siga actuando si el LLM se atasca.
+
+        Estas acciones son de descubrimiento/enum; el LLM sigue siendo libre de
+        elegir la táctica cuando responde correctamente. El fallback solo evita
+        que un fallo de planificación convierta una auditoría en un estado muerto.
+        """
+        history=state.get("history",[])
+        executed={re.sub(r"\s+"," ",h.get("command","").strip()) for h in history if h.get("command")}
+        scan=self.scan_path()
+        scan_text=scan.read_text(encoding="utf-8",errors="ignore").lower() if scan.exists() else ""
+        domain=self.domain_name or "active.htb"
+        base_dn=",".join(f"DC={part}" for part in domain.split("."))
+        candidates=[]
+
+        if "389/tcp" in scan_text or "636/tcp" in scan_text or "3268/tcp" in scan_text:
+            candidates.extend([
+                (f"ldapsearch -x -H ldap://{self.target_ip} -s base namingContexts defaultNamingContext dnsHostName","fallback.ldap_rootdse"),
+                (f'ldapsearch -x -H ldap://{self.target_ip} -b "{base_dn}" "(objectClass=user)" sAMAccountName userPrincipalName servicePrincipalName',"fallback.ldap_users"),
+                (f'ldapsearch -x -H ldap://{self.target_ip} -b "{base_dn}" "(objectClass=group)" cn member',"fallback.ldap_groups"),
+            ])
+        if "445/tcp" in scan_text or "139/tcp" in scan_text:
+            candidates.extend([
+                (f"smbclient -L //{self.target_ip} -N","fallback.smb_shares"),
+                (f"enum4linux -U -S -P {self.target_ip}","fallback.enum4linux"),
+            ])
+        if "135/tcp" in scan_text:
+            candidates.extend([
+                (f"rpcclient -U '' -N {self.target_ip} -c 'srvinfo'","fallback.rpc_info"),
+                (f"rpcclient -U '' -N {self.target_ip} -c 'enumdomusers'","fallback.rpc_users"),
+                (f"rpcclient -U '' -N {self.target_ip} -c 'enumdomgroups'","fallback.rpc_groups"),
+            ])
+
+        for command,action_id in candidates:
+            normalized=re.sub(r"\s+"," ",command.strip())
+            if normalized not in executed:
+                logger.warning("[TACTICAL_FALLBACK] LLM estancado; ejecutando %s.",action_id)
+                return command,"fallback",action_id
+        return None
+
     def recovery_action(self,state):
         """Adquisición de evidencia sin depender del LLM."""
         history=state.get("history",[])
         executed={re.sub(r"\s+"," ",h.get("command","").strip()) for h in history if h.get("command")}
         planner_state=state.get("planner_state") or {}
         attempted=set(planner_state.get("recovery_attempts",[]))
-        blocked_goals=set(planner_state.get("blocked_goals",[]))
-        completed_goals=self.completed_goals(history)
+        attempted=set(planner_state.get("recovery_attempts",[]))
         scan=self.scan_path()
         scan_text=scan.read_text(encoding="utf-8",errors="ignore").lower() if scan.exists() else ""
         candidates=[]
@@ -212,11 +251,6 @@ class EnterpriseDynamicAgent:
             candidates.append((f"rpcclient -U '' -N {self.target_ip} -c 'srvinfo'","recovery.rpc_info"))
         for command,action_id in candidates:
             normalized=re.sub(r"\s+"," ",command.strip())
-            goal=self.action_goal(command)
-            if goal and (goal in completed_goals or goal in blocked_goals):
-                logger.info("[RECOVERY] %s omitido: objetivo %s ya completado/bloqueado.",action_id,goal)
-                attempted.add(action_id)
-                continue
             if action_id in attempted or normalized in executed:
                 continue
             new_planner_state={**planner_state,"status":"RECOVERY","recovery_attempts":sorted(attempted|{action_id}),"last_reason":action_id}
@@ -231,15 +265,13 @@ class EnterpriseDynamicAgent:
             cmd=h.get("command","")
             if cmd: blocked.append(re.sub(r"\s+"," ",cmd.strip()))
         planner=LLMDecisionEngine()
-        completed=self.completed_goals(history)
         planner_state=state.get("planner_state") or {}
-        blocked_goals=set(planner_state.get("blocked_goals",[]))
         blocked_actions=set(planner_state.get("blocked_actions",[]))
         autonomy_context=self.autonomy.context(state)
         planner_context=("No hay flag todavía. Debes continuar la auditoría. NO declares mission_complete hasta detectar una flag. "
-                         "No repitas objetivos de conocimiento ya completados, bloqueados o agotados. "
-                         f"Objetivos ya completados/bloqueados: {json.dumps(sorted(set(completed)|blocked_goals))}. "
-                         "Si no puedes proponer una acción nueva, devuelve command vacío y no inventes una repetición. "
+                         "Una acción exitosa NO significa que el objetivo semántico esté agotado: puedes y debes usar otra consulta/herramienta "
+                         "si aporta una dimensión distinta de evidencia. No conviertas ldap_query, SMB, RPC ni enumeración en objetivos de una sola ejecución. "
+                         "Si no puedes proponer una acción nueva, devuelve command vacío y el supervisor activará un fallback táctico. "
                          "El LLM conserva libertad táctica para elegir el siguiente objetivo y herramienta; el supervisor impide repeticiones estériles. "
                          f"Estado de autonomía: {json.dumps(autonomy_context, ensure_ascii=False)}. "
                          "Comandos ya ejecutados y que NO debes repetir exactamente: "+json.dumps(blocked)+"\n")
@@ -258,11 +290,6 @@ class EnterpriseDynamicAgent:
                 augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_EMPTY]","output":"El planner no propuso una acción."})
                 continue
             normalized=re.sub(r"\s+"," ",cmd.strip())
-            goal=self.action_goal(cmd)
-            if goal and (goal in completed or goal in blocked_goals):
-                blocked_goals.add(goal)
-                augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_COMPLETED_GOAL]","output":f"Objetivo semántico {goal!r} ya completado/bloqueado."})
-                continue
             action_id=f"llm.{self.fingerprint(cmd)}"
             if action_id in blocked_actions:
                 augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_BLOCKED_ACTION]","output":f"Acción bloqueada: {action_id}"})
@@ -277,20 +304,14 @@ class EnterpriseDynamicAgent:
             state,
             status="STALLED",
             stalled_attempts=stalled,
-            blocked_goals=sorted(set(completed)|blocked_goals),
+            blocked_goals=list(planner_state.get("blocked_goals",[])),
             blocked_actions=sorted(blocked_actions),
             last_reason="no_new_action"
         )
         logger.warning("[!] Planner agotó sus %d reintentos sin una acción nueva.",MAX_PLANNER_RETRIES)
-        if stalled >= MAX_PLANNER_STALLS:
-            exhausted=self.persist_planner_state(
-                updated,
-                status="EXHAUSTED",
-                stalled_attempts=stalled,
-                last_reason="planner_stall_budget_exhausted"
-            )
-            logger.error("[!] Presupuesto de estancamiento del planner agotado (%d); deteniendo misión sin entrar en recovery infinito.",MAX_PLANNER_STALLS)
-            return None
+        fallback=self.tactical_fallback(updated)
+        if fallback:
+            return fallback
         return self.recovery_action(updated)
 
     def determine_next_action(self,state):
@@ -331,21 +352,7 @@ class EnterpriseDynamicAgent:
             attempts=state.get("action_attempts",{}).get(action_id,0); recent=state.get("history",[]); fp=self.fingerprint(command)
             repeats=sum(self.fingerprint(h.get("command",""))==fp for h in recent[-6:])
             semantic_repeats=self.semantic_repeats(recent,command)
-            goal=self.action_goal(command)
-            completed_goals=self.completed_goals(recent)
-            if goal=="remote_session_access" and goal in completed_goals:
-                logger.warning("[!] Objetivo de acceso remoto ya completado; se bloquea otra variante sin evidencia nueva.")
-                state.setdefault("history",[]).append({"step":self.current_step,"command":"[BLOCKED_NO_PROGRESS]","output":f"Objetivo ya completado: {goal}"})
-                self.state_manager.save_state(self.current_step,state["history"][-1],"autonomous",False); self.current_step+=1; continue
-            if goal=="ntp_time_synchronization" and goal in completed_goals:
-                logger.warning("[!] Objetivo NTP ya completado; se bloquea nueva sincronización sin evidencia nueva.")
-                state.setdefault("history",[]).append({"step":self.current_step,"command":"[BLOCKED_NO_PROGRESS]","output":f"Objetivo ya completado: {goal}"})
-                self.state_manager.save_state(self.current_step,state["history"][-1],"autonomous",False); self.current_step+=1; continue
-            if goal and goal in completed_goals:
-                logger.warning("[!] Objetivo semántico ya completado: %s. Se fuerza replanning.",goal)
-                state.setdefault("history",[]).append({"step":self.current_step,"command":"[BLOCKED_NO_PROGRESS]","output":f"Objetivo ya completado: {goal}"})
-                self.state_manager.save_state(self.current_step,state["history"][-1],"autonomous",False); self.current_step+=1; continue
-            if attempts>=MAX_SAME_ACTION_ATTEMPTS or repeats>=MAX_SAME_ACTION_ATTEMPTS or semantic_repeats>=MAX_SAME_ACTION_ATTEMPTS:
+            if attempts>=MAX_SAME_ACTION_ATTEMPTS or repeats>=MAX_SAME_ACTION_ATTEMPTS:
                 logger.warning("[!] Acción repetida bloqueada: %s. Se fuerza replanning autónomo.",action_id)
                 state.setdefault("history",[]).append({"step":self.current_step,"command":"[BLOCKED_DUPLICATE]","output":f"Acción bloqueada: {command}"})
                 self.state_manager.save_state(self.current_step,state["history"][-1],"autonomous",False); self.current_step+=1; continue

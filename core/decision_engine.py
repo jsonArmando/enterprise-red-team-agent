@@ -2,7 +2,7 @@
 from __future__ import annotations
 import json, os, httpx
 
-ALLOWED_ACTIONS={"recon","vulnerability_scan","cve_lookup","analyze_candidate","validate_candidate","exploit_candidate","post_exploit_enum","privilege_escalation","verify_flags","replan"}
+ALLOWED_ACTIONS={"recon","vulnerability_scan","cve_lookup","analyze_candidate","validate_candidate","exploit_candidate","establish_access","session_enum","post_exploit_enum","privilege_escalation","verify_flags","replan"}
 
 class DecisionEngine:
     def __init__(self):
@@ -13,7 +13,7 @@ class DecisionEngine:
     def decide(self,state):
         if not self.api_key: return self._fallback(state)
         prompt={"mission":state.get("mission"),"objective":state.get("objective"),"flags":state.get("flags",{}),"recon_complete":state.get("recon_complete"),"vulnerability_scan_complete":state.get("vulnerability_scan_complete"),"potential_exploits_ready":state.get("potential_exploits_ready"),"vulnerabilities":state.get("vulnerabilities",[]),"hypotheses":state.get("hypotheses",[]),"recent_history":state.get("history",[])[-10:],"evidence":state.get("evidence_ledger",[])[-15:]}
-        system="You are the autonomous decision engine for an authorized HTB/lab. Choose one registered action from evidence. After enumeration, analyze every potential exploit candidate line by line using its evidence_lines, CVE, service, version, port and exploit references. A candidate must be validated before exploitation. Never declare mission completion; the verifier owns completion. Return JSON with action, candidate_id, reason, priority."
+        system="You are the autonomous decision engine for an authorized HTB/lab. Choose one registered action from evidence. After enumeration, analyze every potential exploit candidate line by line using evidence_lines, CVE, service, version, port and exploit references. A candidate must be validated before exploitation. After an exploit, manage access/session state, perform post-exploitation enumeration, and pursue privilege escalation based on observed evidence. Do not repeat failed paths without new evidence. Never declare mission completion; the verifier owns completion. Return JSON with action, candidate_id, reason, priority."
         try:
             r=httpx.post(f"{self.base_url}/chat/completions",headers={"Authorization":f"Bearer {self.api_key}","Content-Type":"application/json"},json={"model":self.model,"temperature":0.1,"messages":[{"role":"system","content":system},{"role":"user","content":json.dumps(prompt,ensure_ascii=False)}]},timeout=90)
             r.raise_for_status()
@@ -60,6 +60,8 @@ class DecisionEngine:
             return {"action":"validate_candidate","candidate_id":unvalidated[0].get("id"),"reason":"Validate candidate preconditions","priority":0.92}
         if validated:
             return {"action":"exploit_candidate","candidate_id":validated[0].get("id"),"reason":"Exploit validated lab candidate","priority":0.90}
+        if state.get("foothold") and not state.get("session_established"): return {"action":"establish_access","candidate_id":None,"reason":"Foothold exists; establish stable lab session","priority":0.99}
+        if state.get("session_established") and not flags.get("user_verified"): return {"action":"session_enum","candidate_id":None,"reason":"Enumerate active session for user objective","priority":0.97}
         if flags.get("user_verified") and not flags.get("root_verified"): return {"action":"privilege_escalation","candidate_id":None,"reason":"User verified; pursue root objective","priority":0.98}
         if state.get("foothold"): return {"action":"post_exploit_enum","candidate_id":None,"reason":"Generate new post-exploit evidence","priority":0.90}
         return {"action":"replan","candidate_id":None,"reason":"No unprocessed candidate; acquire new evidence","priority":0.70}

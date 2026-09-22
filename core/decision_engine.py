@@ -23,6 +23,28 @@ class DecisionEngine:
             return d
         except Exception: return self._fallback(state)
 
+    def analyze_candidate(self, candidate:dict, state:dict)->dict:
+        """Analyze candidate evidence line-by-line; returns validation intent, never a shell command."""
+        lines=candidate.get("evidence_lines") or []
+        relevant=[]
+        for item in lines:
+            text=str(item.get("text",""))
+            relevant.append({"line":item.get("line"),"text":text[:2000],"cves":item.get("cves",[]),"ports":item.get("ports",[])})
+        if not candidate.get("cve") or not relevant:
+            return {"valid":False,"confidence":0.1,"reason":"Insufficient line-level evidence"}
+        if not self.api_key:
+            return {"valid":True,"confidence":candidate.get("confidence",0.6),"reason":"Candidate has CVE and correlated scanner evidence"}
+        payload={"candidate":{k:candidate.get(k) for k in ("id","cve","target","service","version","port","confidence","exploit_references","evidence_lines")},"mission":state.get("mission"),"objective":state.get("objective"),"recent_failures":state.get("failed_paths",[])}
+        system="Analyze this authorized-lab vulnerability candidate line by line. Determine whether the scanner evidence plausibly maps the CVE to the target service. Return JSON only: {valid:boolean,confidence:number,reason:string}. Do not produce exploit commands."
+        try:
+            r=httpx.post(f"{self.base_url}/chat/completions",headers={"Authorization":f"Bearer {self.api_key}","Content-Type":"application/json"},json={"model":self.model,"temperature":0.0,"messages":[{"role":"system","content":system},{"role":"user","content":json.dumps(payload,ensure_ascii=False)}]},timeout=90)
+            r.raise_for_status()
+            raw=r.json()["choices"][0]["message"]["content"].strip().replace("```json","").replace("```","").strip()
+            d=json.loads(raw)
+            return {"valid":bool(d.get("valid")),"confidence":float(d.get("confidence",0.0)),"reason":str(d.get("reason",""))}
+        except Exception:
+            return {"valid":True,"confidence":candidate.get("confidence",0.6),"reason":"Fallback: correlated CVE evidence is present"}
+
     def _fallback(self,state):
         flags=state.get("flags",{})
         if flags.get("complete"): return {"action":"verify_flags","candidate_id":None,"reason":"Independent flag verification","priority":1.0}

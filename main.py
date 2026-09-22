@@ -134,7 +134,7 @@ class EnterpriseDynamicAgent:
         before=self._world(state); r=self.executor.execute_with_polling(d["command"]); output=r.get("stdout","")
         if r.get("stderr"): output+="\nSTDERR:\n"+r["stderr"]
         provisional={"event_type":"action","step":self.current_step,"action_class":d.get("action_class","unspecified"),"goal_id":d.get("goal_id",""),"hypothesis_id":d.get("hypothesis_id",""),"evidence_question":d.get("evidence_question",""),"resource":d.get("resource",""),"command":d["command"],"output":output[:8000],"returncode":r.get("returncode"),"status":r.get("status")}
-        after_reasoning=self.reasoning.update(output,state.get("history",[])+[provisional])
+        after_reasoning=self.reasoning.update(output,state.get("history",[])+[provisional],d.get("command", ""))
         after={"facts":after_reasoning.get("facts",[]),"capabilities":after_reasoning.get("capabilities",[]),"hypotheses":after_reasoning.get("hypotheses",[])}
         oldf={str(x).lower() for x in before.get("facts",[])}; newf={str(x).lower() for x in after.get("facts",[])}; oldc={str(x).lower() for x in before.get("capabilities",[])}; newc={str(x).lower() for x in after.get("capabilities",[])}
         oldh={h.get("id"):h.get("confidence") for h in before.get("hypotheses",[]) if h.get("id")}; conf=0.0
@@ -165,7 +165,7 @@ class EnterpriseDynamicAgent:
             if not CommandSanitizer.validate_command_safety(d["command"]): self._block(state,"execution_policy_rejected",d); return
             entry=self._execute(state,d); ps=dict(state.get("planner_state") or {}); streak=int(ps.get("no_progress_streak",0)); streak=streak+1 if entry.get("no_new_evidence") else 0
             ps.update({"status":"NO_PROGRESS" if entry.get("no_new_evidence") else "PROGRESS","no_progress_streak":streak,"last_reason":"no_new_evidence" if entry.get("no_new_evidence") else "new_evidence"})
-            reasoning=self.reasoning.update(entry.get("output",""),state.get("history",[])+[entry])
+            reasoning=self.reasoning.update(entry.get("output",""),state.get("history",[])+[entry],entry.get("command", ""))
             self.state_manager.save_state(self.current_step,entry,phase=entry.get("action_class","autonomous"),mission_complete=False,extra={"planner_state":ps,"reasoning":reasoning,"last_action":{k:entry.get(k) for k in ("action_class","goal_id","hypothesis_id","evidence_question","resource")}})
             if streak>=MAX_NO_PROGRESS_STREAK: logger.error("[!] Progress budget exhausted; stopping safely."); return
             self.current_step+=1; time.sleep(1)

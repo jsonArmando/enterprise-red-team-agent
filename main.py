@@ -101,7 +101,9 @@ class EnterpriseDynamicAgent:
         return {"world":self._world(state),"recent_actions":[{k:h.get(k) for k in ("step","action_class","goal_id","hypothesis_id","evidence_question","resource","command","returncode","evidence_delta","capability_delta","no_new_evidence")} for h in state.get("history",[])[-12:] if h.get("event_type")=="action"],"blocked_actions":self._recent_blocked_actions(state),"mission":{"complete":bool(state.get("mission_complete")),"progress_streak":int((state.get("planner_state") or {}).get("no_progress_streak",0))}}
 
     def _block(self,state,reason,decision=None):
-        entry={"event_type":"planner_rejection","step":self.current_step,"reason":reason,"decision":decision or {}}
+        decision=decision or {}
+        logger.warning("[!] Planner rejection: %s | action_class=%s | resource=%s | command=%s", reason, decision.get("action_class",""), decision.get("resource",""), decision.get("command",""))
+        entry={"event_type":"planner_rejection","step":self.current_step,"reason":reason,"decision":decision}
         self.state_manager.save_state(self.current_step,entry,phase="planning",mission_complete=False,extra={"planner_state":{**dict(state.get("planner_state") or {}),"last_reason":reason}})
 
     def _initial(self):
@@ -121,6 +123,8 @@ class EnterpriseDynamicAgent:
                 self._block(state,"mission_complete_without_flag",d); continue
             if not d["command"]: self._block(state,"empty_action",d); continue
             if not CommandSanitizer.validate_command_safety(d["command"]): self._block(state,"execution_policy_rejected",d); continue
+            if not str(d.get("action_class") or "").strip(): self._block(state,"missing_action_class",d); continue
+            if not str(d.get("evidence_question") or "").strip(): self._block(state,"missing_evidence_question",d); continue
             if self._is_sterile_repeat(state,d):
                 self._block(state,"sterile_semantic_repeat",d)
                 context["blocked_actions"]=self._recent_blocked_actions({**state,"history":list(state.get("history",[]))+[{"event_type":"action","command":d["command"],"action_class":d.get("action_class"),"resource":d.get("resource"),"returncode":0,"no_new_evidence":True}]})

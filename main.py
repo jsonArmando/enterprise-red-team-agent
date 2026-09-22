@@ -257,8 +257,8 @@ class EnterpriseDynamicAgent:
         text=re.sub(r"\b-H\s+ldap://([^\s]+)", r"-H \1", text)
         text=re.sub(r"\b-h\s+([^\s]+)", r"-H \1", text)
         # Authentication spellings that mean anonymous access are equivalent.
-        text=re.sub(r"\s-U\s+(?:['"]%['"]|['"]['"])", " -U <anon>", text)
-        text=re.sub(r"\s-u\s+(?:['"]%['"]|['"]['"])", " -u <anon>", text)
+        text=re.sub(r"\s-U\s+(?:['\"]%['\"]|['\"]{2})", " -U <anon>", text)
+        text=re.sub(r"\s-u\s+(?:['\"]%['\"]|['\"]{2})", " -u <anon>", text)
         text=re.sub(r"\s-N\b", " -N", text)
         # Collapse redundant quoting around the LDAP base/filter while preserving
         # filter/base/attribute semantics.

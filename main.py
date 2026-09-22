@@ -6,6 +6,7 @@ from utils.smart_executor import SmartCommandExecutor
 from utils.exploit_matcher import ExploitMatcher
 from nodes.dynamic_agent import LLMDecisionEngine, CommandSanitizer
 from core.autonomy import AutonomyEngine
+from core.reasoning import ReasoningState
 from core.security import redact_secrets
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", handlers=[logging.StreamHandler(sys.stdout)])
@@ -27,6 +28,7 @@ class EnterpriseDynamicAgent:
         self.executor=SmartCommandExecutor(timeout_minutes=20,poll_interval=15)
         self.exploit_matcher=ExploitMatcher(target_ip)
         self.autonomy=AutonomyEngine(target_ip)
+        self.reasoning=ReasoningState(state)
         self.recovery_index=0
 
     def extract_domain_from_scan(self,scan_content:str):
@@ -266,12 +268,14 @@ class EnterpriseDynamicAgent:
         planner_state=state.get("planner_state") or {}
         blocked_actions=set(planner_state.get("blocked_actions",[]))
         autonomy_context=self.autonomy.context(state)
+        reasoning_context=self.reasoning.context()
         planner_context=("No hay flag todavía. Debes continuar la auditoría. NO declares mission_complete hasta detectar una flag. "
                          "Una acción exitosa NO significa que el objetivo semántico esté agotado: puedes y debes usar otra consulta/herramienta "
                          "si aporta una dimensión distinta de evidencia. No conviertas ldap_query, SMB, RPC ni enumeración en objetivos de una sola ejecución. "
                          "Si no puedes proponer una acción nueva, devuelve command vacío y el supervisor activará un fallback táctico. "
                          "El LLM conserva libertad táctica para elegir el siguiente objetivo y herramienta; el supervisor impide repeticiones estériles. "
                          f"Estado de autonomía: {json.dumps(autonomy_context, ensure_ascii=False)}. "
+                         f"Modelo del mundo: {json.dumps(reasoning_context, ensure_ascii=False)}. "
                          "Comandos ya ejecutados y que NO debes repetir exactamente: "+json.dumps(blocked)+"\n")
         if potential_exploit and potential_exploit.get("available"):
             planner_context += ("Potential_exploit es SOLO metadata de candidatos y requiere validación contra evidencia; nunca lo trates como comando ejecutable. Candidatos: "+json.dumps(potential_exploit,ensure_ascii=False)[:6000])
@@ -279,7 +283,7 @@ class EnterpriseDynamicAgent:
         augmented_history.append({"step":state.get("step_count",0),"command":"[PLANNER_CONTEXT]","output":planner_context})
         for _ in range(MAX_PLANNER_RETRIES):
             try:
-                decision=planner.consult_tactical_next_step(self.target_ip,augmented_history,state.get("last_output",""),potential_exploit=potential_exploit) or {}
+                decision=planner.consult_tactical_next_step(self.target_ip,augmented_history,state.get("last_output",""),potential_exploit=potential_exploit,reasoning_context=reasoning_context) or {}
             except Exception as exc:
                 logger.exception("[!] Planner exception: %s",exc)
                 break
@@ -363,6 +367,7 @@ class EnterpriseDynamicAgent:
             if result.get("stderr"):output+="\nSTDERR:\n"+result["stderr"]
             raw_entry={"step":self.current_step,"action_id":action_id,"command":command,"output":output[:8000],"status":result.get("status"),"returncode":result.get("returncode")}
             autonomy_update=self.autonomy.observe(state, raw_entry)
+            reasoning_update=self.reasoning.update(output, state.get("history",[]) + [raw_entry])
             persisted_entry=redact_secrets(raw_entry)
             previous_planner_state=dict(state.get("planner_state") or {})
             progress_streak=int(autonomy_update.get("no_progress_streak",0))
@@ -380,7 +385,7 @@ class EnterpriseDynamicAgent:
                 "recovery_attempts":list(previous_planner_state.get("recovery_attempts",[])),
                 "last_reason":reason,
             }
-            self.state_manager.save_state(self.current_step,persisted_entry,phase,False,extra={"last_action_id":action_id,"last_command_fingerprint":fp,"action_attempts":{**state.get("action_attempts",{}),action_id:attempts+1},"potential_exploit":getattr(self,"current_potential_exploit",{"available":False,"candidate_count":0,"candidates":[]}),"autonomy":autonomy_update,"planner_state":next_planner_state})
+            self.state_manager.save_state(self.current_step,persisted_entry,phase,False,extra={"last_action_id":action_id,"last_command_fingerprint":fp,"action_attempts":{**state.get("action_attempts",{}),action_id:attempts+1},"potential_exploit":getattr(self,"current_potential_exploit",{"available":False,"candidate_count":0,"candidates":[]}),"autonomy":autonomy_update,"reasoning":reasoning_update,"planner_state":next_planner_state})
             if progress_streak >= MAX_NO_PROGRESS_STREAK:
                 logger.error("[!] Presupuesto de progreso agotado (%d pasos sin evidencia nueva); deteniendo misión para evitar ciclo táctico.",progress_streak)
                 self.persist_planner_state({**state,"autonomy":autonomy_update},status="EXHAUSTED",stalled_attempts=planner_stalls,no_progress_streak=progress_streak,last_reason="progress_budget_exhausted")

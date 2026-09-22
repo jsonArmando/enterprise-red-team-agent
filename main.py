@@ -130,43 +130,61 @@ class EnterpriseDynamicAgent:
     def _plan(self,state):
         context=self._context(state)
         for _ in range(MAX_PLANNER_RETRIES):
-            d=self.planner.plan(self.target,context)
-            if not isinstance(d,dict): self._block(state,"planner_non_object"); continue
-            d["command"]=CommandSanitizer.clean(str(d.get("command") or ""))
-            if d.get("mission_complete"):
-                if self.flags_found(): return d
-                self._block(state,"mission_complete_without_flag",d); continue
-            if not d["command"]: self._block(state,"empty_action",d); continue
-            if not CommandSanitizer.validate_command_safety(d["command"]): self._block(state,"execution_policy_rejected",d); continue
-            if not str(d.get("action_class") or "").strip(): self._block(state,"missing_action_class",d); continue
-            if not str(d.get("evidence_question") or "").strip(): self._block(state,"missing_evidence_question",d); continue
+            raw=self.planner.plan(self.target,context)
+            if not isinstance(raw,dict):
+                self._block(state,"planner_non_object"); continue
+            candidates=raw.get("candidates")
+            if not isinstance(candidates,list):
+                candidates=[raw] if raw.get("command") else []
+            if raw.get("mission_complete"):
+                if self.flags_found(): return raw
+                self._block(state,"mission_complete_without_flag",raw); continue
             hypotheses=context["world"].get("hypotheses",[])
             goals=context["world"].get("candidate_goals",[])
-            if hypotheses and not str(d.get("hypothesis_id") or "").strip():
-                self._block(state,"missing_hypothesis_id",d); continue
-            if hypotheses and str(d.get("hypothesis_id") or "") not in {str(h.get("id")) for h in hypotheses}:
-                self._block(state,"unknown_hypothesis",d); continue
-            if goals and str(d.get("goal_id") or "") and str(d.get("goal_id")) not in {str(g.get("id")) for g in goals}:
-                self._block(state,"unknown_goal",d); continue
-            logger.info("[?] Decision | latency=%sms | class=%s | intent=%s | hypothesis=%s | goal=%s | resource=%s | question=%s | rationale=%s",
-                        d.get("_planner_latency_ms","?"), d.get("action_class",""), ReasoningState.action_intent(d["command"]),
-                        d.get("hypothesis_id",""), d.get("goal_id",""), d.get("resource",""), d.get("evidence_question",""), d.get("rationale",""))
+            valid_h={str(h.get("id")) for h in hypotheses if h.get("id")}
+            valid_g={str(g.get("id")) for g in goals if g.get("id")}
             constraints=context.get("selection_constraints",{})
-            if constraints.get("rotate_surface") and ReasoningState.action_intent(d["command"]).startswith("enumerate_ldap:"):
-                self._block(state,"surface_rotation_required",d)
-                constraints["avoid_action_prefixes"]=["enumerate_ldap:"]
-                constraints["last_rejection"]="The candidate stayed on the dominant LDAP family; select an observed alternative surface."
-                continue
-            decision=ActionPolicy(state.get("history",[])).evaluate(d)
-            if not decision["allowed"]:
-                self._block(state,decision["reason"],d); continue
-            d["evidence_question_key"]=decision["question_key"]
-            d["command_key"]=ActionPolicy.command_key(d["command"])
-            valid={str(h.get("id")) for h in context["world"].get("hypotheses",[]) if h.get("id")}; hid=str(d.get("hypothesis_id") or "")
-            if hid and valid and hid not in valid: self._block(state,"unknown_hypothesis",d); continue
-            return d
+            accepted=[]
+            seen_intents=set()
+            for candidate in candidates[:6]:
+                if not isinstance(candidate,dict): continue
+                d=dict(candidate)
+                d["command"]=CommandSanitizer.clean(str(d.get("command") or ""))
+                if not d["command"] or not CommandSanitizer.validate_command_safety(d["command"]):
+                    self._block(state,"candidate_execution_policy_rejected",d); continue
+                required=("action_class","evidence_question","hypothesis_id","evidence_basis")
+                if any(not str(d.get(k) or "").strip() for k in required):
+                    self._block(state,"candidate_missing_reasoning_fields",d); continue
+                hid=str(d.get("hypothesis_id") or "")
+                gid=str(d.get("goal_id") or "")
+                if valid_h and hid not in valid_h:
+                    self._block(state,"candidate_unknown_hypothesis",d); continue
+                if valid_g and gid and gid not in valid_g:
+                    self._block(state,"candidate_unknown_goal",d); continue
+                intent=ReasoningState.action_intent(d["command"])
+                if intent in seen_intents:
+                    self._block(state,"candidate_semantic_duplicate",d); continue
+                seen_intents.add(intent)
+                if constraints.get("rotate_surface") and intent.startswith("enumerate_ldap:"):
+                    self._block(state,"surface_rotation_required",d); continue
+                decision=ActionPolicy(state.get("history",[])).evaluate(d)
+                if not decision["allowed"]:
+                    self._block(state,decision["reason"],d); continue
+                d["evidence_question_key"]=decision["question_key"]
+                d["command_key"]=ActionPolicy.command_key(d["command"])
+                d["novelty"]=1.0
+                accepted.append(d)
+            if accepted:
+                ranked=ActionPolicy(state.get("history",[])).rank(accepted)
+                selected=ranked[0]
+                selected["_planner_latency_ms"]=raw.get("_planner_latency_ms")
+                logger.info("[?] Candidates=%d accepted=%d | selected=%s | intent=%s | gain=%s | cost=%s | hypothesis=%s | question=%s | rationale=%s",
+                            len(candidates),len(accepted),selected.get("action_class",""),ReasoningState.action_intent(selected["command"]),
+                            selected.get("expected_information_gain","?"),selected.get("cost","?"),
+                            selected.get("hypothesis_id",""),selected.get("evidence_question",""),selected.get("rationale",""))
+                return selected
+            self._block(state,"no_evidence_grounded_candidate",{"candidate_count":len(candidates)})
         return None
-
     def _execute(self,state,d):
         before=self._world(state); started=time.monotonic(); r=self.executor.execute_with_polling(d["command"]); execution_ms=round((time.monotonic()-started)*1000); output=r.get("stdout","")
         if r.get("stderr"): output+="\nSTDERR:\n"+r["stderr"]

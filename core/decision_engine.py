@@ -7,7 +7,7 @@ ALLOWED_ACTIONS = {
     "recon","vulnerability_scan","discover_kali_tools","cve_lookup",
     "analyze_candidate","validate_candidate","exploit_candidate","run_kali_tool",
     "establish_access","reverse_shell","session_enum","post_exploit_enum",
-    "analyze_privesc","privilege_escalation","verify_flags","replan",
+    "analyze_privesc","validate_privesc","privilege_escalation","verify_flags","replan",
 }
 
 class DecisionEngine:
@@ -203,9 +203,15 @@ class DecisionEngine:
 
         if flags.get("user_ok") and not flags.get("root_ok"):
             hypotheses=state.get("privesc_candidates",[])
-            pending=[h for h in hypotheses if h.get("status") in {"discovered","analyzed"}]
-            if pending:
+            pending_discovery=[h for h in hypotheses if h.get("status")=="discovered"]
+            pending_validation=[h for h in hypotheses if h.get("status")=="analyzed"]
+            validated=[h for h in hypotheses if h.get("status")=="validated"]
+            if pending_discovery:
                 return {"action":"analyze_privesc","candidate_id":None,"reason":"Evaluate privilege escalation hypotheses","priority":0.95}
-            return {"action":"privilege_escalation","candidate_id":None,"reason":"Attempt validated privilege-escalation hypothesis","priority":0.94}
+            if pending_validation:
+                return {"action":"validate_privesc","candidate_id":None,"reason":"Validate selected privilege escalation hypothesis","priority":0.945}
+            if validated:
+                return {"action":"privilege_escalation","candidate_id":None,"reason":"Execute validated privilege escalation hypothesis","priority":0.94}
+            return {"action":"replan","candidate_id":None,"reason":"No viable privilege escalation hypothesis remains","priority":0.80}
 
         return {"action":"verify_flags","candidate_id":None,"reason":"Verify objective state","priority":0.90}

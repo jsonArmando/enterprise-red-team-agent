@@ -93,16 +93,20 @@ class ReasoningState:
             return "transform_credential_or_secret_material"
         if any(x in text for x in ("cat ", "head ", "tail ", "less ", "more ", "jq ", "xmllint ", "grep ", "sed ")):
             return "inspect_local_artifact"
-        if any(x in text for x in ("get ", "mget ", "wget ", "curl ", "download")):
-            return "retrieve_remote_artifact"
         if "smbclient" in text:
             resource = "server"
-            m = re.search(r"smbclient\\s+[^ ]*//[^/\\s]+/([^\\s'\"]+)", text)
+            m = re.search(r"smbclient\s+[^ ]*//[^/\s]+/([^\s'\"]+)", text)
             if not m:
-                m = re.search(r"//[^/\\s]+/([^\\s'\"]+)", text)
+                m = re.search(r"//[^/\s]+/([^\s'\"]+)", text)
             if m:
                 resource = re.sub(r"[^a-z0-9_.-]", "", m.group(1)) or "server"
+            # A get/mget is retrieval, not merely inspection of the SMB surface.
+            # Keep the resource scope so different shares remain distinct.
+            if re.search(r"\b(?:mget|get|reget)\b", text):
+                return f"retrieve_remote_artifact:{resource}"
             return f"inspect_smb_resource:{resource}"
+        if any(x in text for x in ("get ", "mget ", "wget ", "curl ", "download")):
+            return "retrieve_remote_artifact"
         if any(x in text for x in ("ldapsearch", "rpcclient", "enum4linux", "smbmap")):
             return "enumerate_remote_surface"
         return text[:180]

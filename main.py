@@ -247,9 +247,27 @@ class EnterpriseDynamicAgent:
                 goals.add(goal)
         return goals
 
+    @staticmethod
+    def semantic_goal_key(command):
+        """Stable evidence-question key across equivalent tool syntax."""
+        text=re.sub(r"\\s+"," ",str(command or "").strip().lower())
+        if not text:
+            return "empty"
+        family=EnterpriseDynamicAgent.action_family(text)
+        # Normalize transport spelling without collapsing materially different
+        # queries, filters, resources, or artifacts.
+        text=re.sub(r"\\bldap://", "", text)
+        text=re.sub(r"(?<=-h )(?=[0-9a-z_.-]+)", "", text)
+        text=text.replace(" -h ", " -H ")
+        text=re.sub(r"(?<=-h )", "", text)
+        # Equivalent SMB authentication spellings should share an evidence key.
+        text=re.sub(r"-u ['\"]?%['\"]?|-u ['\"]?['\"]?", "-u <anon>", text)
+        text=re.sub(r"-n ", "-N ", text)
+        return f"{family}|{text}"
+
     def semantic_repeats(self,history,command):
-        family=self.action_family(command)
-        return sum(self.action_family(h.get("command",""))==family for h in history if h.get("command"))
+        key=self.semantic_goal_key(command)
+        return sum(self.semantic_goal_key(h.get("command",""))==key for h in history if h.get("command"))
 
     def persist_planner_state(self,state,**updates):
         planner_state=dict(state.get("planner_state") or {})
@@ -465,6 +483,22 @@ class EnterpriseDynamicAgent:
             if semantic_repeat:
                 logger.warning("[!] Acción semánticamente repetida sin evidencia nueva: %s",action_intent)
                 blocked_entry={"step":self.current_step,"command":"[BLOCKED_SEMANTIC_REPEAT]","output":f"Intent bloqueado: {action_intent}","action_intent":action_intent}
+                self.state_manager.save_state(self.current_step,blocked_entry,"autonomous",False)
+                self.current_step+=1
+                continue
+
+            # Evidence-question guard: different command syntax is not enough
+            # to justify asking the same semantic question again.
+            goal_key=self.semantic_goal_key(command)
+            repeated_goal=any(
+                self.semantic_goal_key(h.get("command","")) == goal_key
+                and h.get("returncode") == 0
+                and h.get("no_new_evidence") is not True
+                for h in recent[-12:]
+            )
+            if repeated_goal:
+                logger.warning("[!] Pregunta de evidencia repetida; se fuerza replanning: %s",goal_key)
+                blocked_entry={"step":self.current_step,"command":"[BLOCKED_REPEAT_GOAL]","output":f"Pregunta ya cubierta: {goal_key}","semantic_goal_key":goal_key}
                 self.state_manager.save_state(self.current_step,blocked_entry,"autonomous",False)
                 self.current_step+=1
                 continue

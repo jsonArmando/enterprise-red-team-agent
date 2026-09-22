@@ -79,6 +79,8 @@ class ReasoningState:
             + [str(h.get("command", "")) for h in recent]
         ).lower()
         capabilities = []
+        if re.search(r"\b(?:445/tcp|139/tcp|microsoft-ds|netbios-ssn|smb|cifs)\b", text):
+            capabilities.append("smb_surface")
         if re.search(r"\b(?:open|accessible|listing).{0,80}\b(?:smb|cifs|share)\b|\b(?:smb|cifs).{0,80}\b(?:accessible|anonymous|read)\b", text):
             capabilities.append("smb_access")
         if re.search(r"\b(?:ldap|389/tcp|636/tcp|3268/tcp)\b", text):
@@ -325,7 +327,7 @@ class ReasoningState:
                 0.8, 0.4
             )
 
-        if "smb_access" in capabilities:
+        if "smb_surface" in capabilities or "smb_access" in capabilities:
             add(
                 "H-RESOURCE-SURFACE",
                 "El acceso SMB puede exponer recursos distintos con evidencia adicional.",
@@ -451,6 +453,7 @@ class ReasoningState:
             "directory_enumeration": "map_directory_relationships",
             "service_relationships": "map_service_relationships",
             "share_access": "map_accessible_resources",
+            "smb_surface": "enumerate_remote_resources",
             "artifact_contents": "understand_policy_artifacts",
             "identity_material": "validate_identity_capabilities",
             "access_transition": "validate_capability_transition",

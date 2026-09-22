@@ -125,7 +125,20 @@ class ReasoningState:
             return f"inspect_smb_resource:{resource}"
         if any(x in text for x in ("get ", "mget ", "wget ", "curl ", "download")):
             return "retrieve_remote_artifact"
-        if any(x in text for x in ("ldapsearch", "rpcclient", "enum4linux", "smbmap")):
+        if "ldapsearch" in text:
+            base = "default"
+            m = re.search(r"\s-b\s+([^\s]+)", text)
+            if m:
+                base = re.sub(r"[^a-z0-9=,._-]", "", m.group(1))
+            scope = "base" if re.search(r"\s-s\s+base\b", text) else ("one" if re.search(r"\s-s\s+one\b", text) else "sub")
+            filt = "none"
+            m = re.search(r"\s(\([^)]{3,160}\))", text)
+            if m:
+                filt = re.sub(r"\s+", "", m.group(1))
+            attrs = text.split()[-6:]
+            attr_key = ",".join(sorted(a for a in attrs if re.fullmatch(r"[a-z][a-z0-9-]{1,40}", a)))
+            return f"enumerate_ldap:{base}:{scope}:{filt}:{attr_key}"
+        if any(x in text for x in ("rpcclient", "enum4linux", "smbmap")):
             return "enumerate_remote_surface"
         return text[:180]
 

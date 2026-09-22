@@ -1,28 +1,53 @@
-# 🛡️ Enterprise Dynamic Red Team Agent
+# Enterprise Dynamic Red Team Agent
 
-Agente autónomo inteligente diseñado para automatizar fases de reconocimiento, enumeración y explotación en ejercicios de Red Team y pentesting (compatible con entornos corporativos y máquinas de laboratorios como Hack The Box).
+Authorized-lab agent for **Hack The Box / classroom ranges only**.
 
-## 🚀 Características Principales
+It runs a policy-gated playbook: recon → enum → optional assume-breach → loot `user.txt` / `root.txt`.
 
-* **Autonomía Adaptativa:** Utiliza un motor de decisión dinámico basado en estados para decidir el siguiente paso en la cadena de ataques (*Kill Chain*).
-* **Auto-descubrimiento de Red:** Analiza automáticamente los resultados de los escaneos de `nmap` para detectar nombres de dominio (FQDN) y configurar el entorno (`/etc/hosts`) sobre la marcha.
-* **Soporte Multi-entorno:** Capaz de adaptarse tanto a infraestructuras de **Active Directory** (Kerberos, SMB, RPC, LDAP) como a entornos genéricos de Linux/Web.
-* **Correlación de Exploits:** Integra un módulo (`ExploitMatcher`) que contrasta las versiones de los servicios descubiertos con bases de datos de exploits.
-* **Persistencia de Estado:** Guarda el historial de ejecución y verifica continuamente la captura de flags (`user.txt` / `root.txt`) para detenerse automáticamente al completar la misión.
+## Scope (hard gate)
 
----
+Commands run only if the target IP is in:
 
-## 📂 Estructura del Proyecto
+- `10.10.0.0/16`
+- `10.129.0.0/16`
+- `10.13.0.0/16`
+
+or a domain ending in `.htb` / `.lab` / `.local`.
+
+Override with `ALLOWED_NETWORKS=cidr,cidr` for *your* lab. Do not point this at the public Internet.
+
+## Run (Kali)
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # optional SUDO_PASS for /etc/hosts
+
+python3 main.py 10.129.x.x
+python3 main.py 10.129.x.x --user rose --password 'labpass'
+python3 main.py 10.129.x.x --dry-run
+```
+
+State and loot: `testing/<ip>/agent_state.json` and `testing/<ip>/loot/`.
+
+## Layout
 
 ```text
-kali-redteam-agent/
-│
-├── core/
-│   └── state_manager.py     # Gestor de estado y persistencia de la misión
-├── utils/
-│   ├── smart_executor.py    # Ejecutor seguro de comandos con control de tiempo
-│   └── exploit_matcher.py   # Módulo de correlación de vulnerabilidades
-├── testing/                 # Carpeta de salida (scans, loot y evidencias)
-├── agent.py                 # Script principal del agente autónomo
-├── .gitignore
-└── README.md
+main.py                 # policy + playbook loop
+core/policy_engine.py   # allowlist
+core/playbook.py        # nmap, nxc, kerbrute, gobuster, winrm/ssh loot
+core/flags.py           # 32-hex HTB flags
+core/state_manager.py
+utils/smart_executor.py
+nodes/                  # experimental LangGraph path (optional)
+kali-redteam-agent/     # older compact copy
+```
+
+## What it will not do
+
+- Skip the policy engine
+- Commit VPN profiles (`.ovpn` gitignored)
+- Treat the string `user.txt` as a flag (needs a 32-hex value)
+- Use a hardcoded sudo password
+
+Flags still require valid lab credentials or a working foothold. Pass `--user/--password` when the box is assume-breach (HTB Easy AD).

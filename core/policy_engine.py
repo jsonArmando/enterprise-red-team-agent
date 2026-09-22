@@ -1,34 +1,59 @@
-# core/policy_engine.py
+"""Authorize only in-scope lab targets before any command runs."""
+from __future__ import annotations
+
 import ipaddress
 import logging
+import os
+import re
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PolicyEngine")
 
-def evaluate_policy(target: str, scope_policy: dict) -> bool:
-    """
-    Evalúa si el objetivo se encuentra dentro del rango autorizado por la misión.
-    Evita que el agente ejecute acciones fuera del scope definido.
-    """
-    allowed_networks = scope_policy.get("allowed_networks", [])
-    forbidden_targets = scope_policy.get("forbidden_targets", [])
+DEFAULT_NETS = [
+    "10.10.0.0/16",    # HTB starting point / tun
+    "10.129.0.0/16",   # HTB machines
+    "10.13.0.0/16",
+    "127.0.0.1/32",
+]
 
-    if target in forbidden_targets:
-        logger.warning(f"[-] [Policy Engine] BLOQUEADO: El objetivo {target} está en la lista negra.")
+DEFAULT_DOMAINS = (".htb", ".lab", ".local")
+
+
+def _nets() -> list[str]:
+    extra = os.getenv("ALLOWED_NETWORKS", "")
+    nets = list(DEFAULT_NETS)
+    if extra:
+        nets.extend([n.strip() for n in extra.split(",") if n.strip()])
+    return nets
+
+
+def evaluate_policy(target: str, scope_policy: dict | None = None) -> bool:
+    scope_policy = scope_policy or {}
+    allowed_networks = scope_policy.get("allowed_networks") or _nets()
+    forbidden = set(scope_policy.get("forbidden_targets") or [])
+    allowed_domains = scope_policy.get("allowed_domains") or list(DEFAULT_DOMAINS)
+
+    if not target or target in forbidden:
+        logger.warning("[-] Policy BLOCKED empty/forbidden target")
         return False
 
-    try:
-        target_ip = ipaddress.ip_address(target)
-        for net in allowed_networks:
-            if target_ip in ipaddress.ip_network(net, strict=False):
-                logger.info(f"[+] [Policy Engine] APROBADO: {target} está dentro del rango {net}.")
-                return True
-    except ValueError:
-        # Si es un dominio o URL, validar contra dominios permitidos
-        allowed_domains = scope_policy.get("allowed_domains", [])
-        if any(domain in target for domain in allowed_domains):
-            logger.info(f"[+] [Policy Engine] APROBADO: Dominio {target} autorizado.")
-            return True
+    host = target.split("@")[-1]
+    host = host.split("/")[0]
+    host = host.split(":")[0]
 
-    logger.warning(f"[-] [Policy Engine] RECHAZADO: {target} fuera de alcance autorizado.")
-    return False
+    try:
+        ip = ipaddress.ip_address(host)
+        for net in allowed_networks:
+            if ip in ipaddress.ip_network(net, strict=False):
+                logger.info("[+] Policy ALLOW %s in %s", host, net)
+                return True
+        logger.warning("[-] Policy DENY IP %s not in allowed_networks", host)
+        return False
+    except ValueError:
+        if any(host.endswith(d) or d in host for d in allowed_domains):
+            logger.info("[+] Policy ALLOW domain %s", host)
+            return True
+        if re.match(r"^[A-Za-z0-9._-]+$", host):
+            logger.warning("[-] Policy DENY host %s (not *.htb/*.lab)", host)
+            return False
+        logger.warning("[-] Policy DENY %s", target)
+        return False

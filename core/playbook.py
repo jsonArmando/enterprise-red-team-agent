@@ -6,7 +6,6 @@ from pathlib import Path
 from core.lfi_probe import probe_command
 
 STOP = ("__STOP__", "stop")
-
 OSTICKET_PATHS = "/ /scp /open.php /login.php /tickets.php /kb/faq.php"
 
 
@@ -37,7 +36,14 @@ class LabPlaybook:
         scan = self._scan_text()
         ip = self.ip
         ad = any(x in scan for x in ("88/tcp", "389/tcp", "445/tcp", "kerberos", "microsoft-ds"))
-        web = any(x in scan for x in ("80/tcp", "443/tcp", "http"))
+        web = ("80/tcp" in scan and "open" in scan) or ("443/tcp" in scan and "open" in scan)
+        # nmap script lines contain 'http' even without a web port
+        really_web = any(
+            line.split()[0].startswith(("80/tcp", "443/tcp", "8080/tcp")) and " open " in line
+            for line in scan.splitlines()
+            if "/tcp" in line
+        )
+        web = really_web
         mssql = "1433/tcp" in scan
         winrm = "5985/tcp" in scan
         ssh = "22/tcp" in scan
@@ -78,20 +84,21 @@ class LabPlaybook:
         if ad and not self._done(history, "-u guest"):
             return (f"nxc smb {ip} -u guest -p '' --shares", "enum")
         if ad and not self._done(history, "smbmap"):
-            return (f"smbmap -H {ip} || true", "enum")
+            return (f"smbmap -H {ip} -u anonymous -p '' || smbmap -H {ip} || true", "enum")
+        if ad and not self._done(history, "Replication"):
+            return (
+                f"smbclient -N -L //{ip} 2>/dev/null | tee {self.loot}/smb_shares.txt; "
+                f"smbclient -N //{ip}/Replication -c 'recurse ON; prompt OFF; lcd {self.loot}; mget *Groups.xml' || "
+                f"smbclient -N //{ip}/NETLOGON -c 'recurse ON; prompt OFF; lcd {self.loot}; mget *Groups.xml' || true; "
+                f"find {self.loot} -iname 'Groups.xml' | tee {self.loot}/gpp_files.txt",
+                "enum",
+            )
         if ad and not self._done(history, "smb-vuln"):
             return (f"nmap --script smb-vuln* -p 445 {ip} -oN {self.scans}/smb_vuln.txt || true", "recon")
 
-        names = Path("/usr/share/seclists/Usernames/Names/names.txt")
-        xato = Path("/usr/share/seclists/Usernames/xato-net-10-million-usernames.txt")
-        wl = str(names if names.exists() else xato)
-        if ad and Path(wl).exists() and not self._done(history, "kerbrute"):
-            return (f"kerbrute userenum -d detected.htb --dc {ip} {wl} --threads 20 || true", "enum")
-
         if ad and not self._done(history, "ldapsearch"):
             return (
-                f"ldapsearch -x -H ldap://{ip} -s base namingContexts || "
-                f"ldapsearch -x -H ldap://{ip} -b 'DC=detected,DC=htb' '(objectClass=*)' sAMAccountName || true",
+                f"ldapsearch -x -H ldap://{ip} -s base namingContexts || true",
                 "enum",
             )
 
@@ -137,12 +144,4 @@ class LabPlaybook:
 
         if mssql and not self._done(history, "nxc mssql"):
             return (f"nxc mssql {ip} -u sa -p sa --local-auth || true", "enum")
-        if web and not self._done(history, "gobuster"):
-            w = "/usr/share/wordlists/dirb/common.txt"
-            if not Path(w).exists():
-                w = "/usr/share/seclists/Discovery/Web-Content/common.txt"
-            return (f"gobuster dir -u http://{ip} -w {w} -t 30 -q --timeout 8s || true", "enum")
-        if ad and not self._done(history, "enum4linux"):
-            return (f"enum4linux -a {ip} || true", "enum")
-
         return STOP

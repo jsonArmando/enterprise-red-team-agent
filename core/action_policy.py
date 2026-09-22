@@ -24,9 +24,11 @@ class ActionPolicy:
         ckey=self.command_key(decision.get("command",""))
         for h in self.history[-64:]:
             if h.get("event_type")!="action": continue
-            if h.get("command_key")==ckey and h.get("returncode")==0:
+            prior_command=h.get("command_key") or self.command_key(h.get("command",""))
+            prior_question=h.get("evidence_question_key") or self.question_key(h)
+            if prior_command==ckey and h.get("returncode")==0:
                 return {"allowed":False,"reason":"identical_successful_command","question_key":qkey}
-            if h.get("evidence_question_key")==qkey and h.get("returncode")==0 and h.get("no_new_evidence") is False:
+            if prior_question==qkey and h.get("returncode")==0 and h.get("no_new_evidence") is False:
                 return {"allowed":False,"reason":"evidence_question_answered","question_key":qkey}
         return {"allowed":True,"reason":"candidate_is_novel","question_key":qkey}
 

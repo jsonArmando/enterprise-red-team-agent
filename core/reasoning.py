@@ -178,47 +178,28 @@ class ReasoningState:
         history: List[Dict[str, Any]],
         old: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        """Rank hypotheses by evidence gain, novelty, and recent stagnation.
-
-        This is a lightweight best-first controller inspired by search-based
-        agent planning: the LLM proposes tactics, while explicit state decides
-        which hypothesis deserves attention. It does not encode a target path.
-        """
-        scores = dict(old.get("hypothesis_scores") or {})
-        recent = history[-12:]
+        """Rank hypotheses using explicit progress and information-gain signals."""
+        ranked = []
         for h in hypotheses:
             hid = h.get("id")
             if not hid:
                 continue
-            previous = dict(scores.get(hid) or {})
-            tests = int(previous.get("tests", 0))
-            progress = int(previous.get("progress_events", 0))
-            no_progress = int(previous.get("no_progress", 0))
-            matched = sum(
-                1 for entry in recent
-                if hid in str(entry.get("hypothesis_id", ""))
-            )
-            tests += matched
-            if recent and matched:
-                for entry in recent:
-                    if hid in str(entry.get("hypothesis_id", "")) and entry.get("no_new_evidence") is False:
-                        progress += 1
-                    elif hid in str(entry.get("hypothesis_id", "")):
-                        no_progress += 1
-            # Reward unexplored hypotheses and recent evidence; penalize sterile tests.
-            score = 1.0 + (2.0 if tests == 0 else 0.0) + (1.5 * progress) - (1.25 * no_progress)
-            score += min(2.0, 0.25 * len(capabilities))
-            scores[hid] = {
+            tests = [e for e in history if e.get("hypothesis_id") == hid]
+            progress = sum(1 for e in tests if e.get("no_new_evidence") is False)
+            no_progress = sum(1 for e in tests if e.get("no_new_evidence") is True)
+            # Best-first bias: unexplored hypotheses are valuable; sterile ones decay.
+            score = 1.0 + (2.0 if not tests else 0.0)
+            score += 1.5 * progress
+            score -= 1.25 * no_progress
+            score += min(1.5, 0.25 * len(capabilities))
+            item = dict(h)
+            item["control"] = {
                 "score": round(max(0.0, score), 3),
-                "tests": tests,
+                "tests": len(tests),
                 "progress_events": progress,
                 "no_progress": no_progress,
                 "status": "promising" if score >= 2.0 else "deprioritized",
             }
-        ranked = []
-        for h in hypotheses:
-            item = dict(h)
-            item["control"] = scores.get(h.get("id"), {})
             ranked.append(item)
         return sorted(ranked, key=lambda x: x.get("control", {}).get("score", 0), reverse=True)[:12]
 

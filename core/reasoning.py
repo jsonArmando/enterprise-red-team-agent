@@ -453,6 +453,7 @@ class ReasoningState:
         control = self.control_signal(hypotheses)
         hypothesis_control = self.build_hypothesis_control(hypotheses, control, self.old)
         goals = self.generate_goals(hypotheses, capabilities)
+        vulnerability_signals = self.derive_vulnerability_signals(facts, capabilities, history)
         entities = self.extract_entities(output)
         resources = self.derive_resources(history + [{"output": output, "command": history[-1].get("command", "") if history else "", "step": history[-1].get("step") if history else None}])
 
@@ -463,6 +464,7 @@ class ReasoningState:
             "new_facts": newly_observed[:32],
             "capabilities": capabilities,
             "hypotheses": hypotheses,
+            "vulnerability_signals": vulnerability_signals,
             "hypothesis_scores": {h.get("id"): h.get("control", {}) for h in hypotheses if h.get("id")},
             "control_signal": control,
             "hypothesis_control": hypothesis_control,
@@ -476,6 +478,7 @@ class ReasoningState:
             "facts": self.old.get("facts", [])[-64:],
             "capabilities": self.old.get("capabilities", []),
             "hypotheses": self.old.get("hypotheses", [])[:12],
+            "vulnerability_signals": self.old.get("vulnerability_signals", {}),
             "hypothesis_scores": self.old.get("hypothesis_scores", {}),
             "control_signal": self.old.get("control_signal", {"mode": "explore"}),
             "hypothesis_control": self.old.get("hypothesis_control", {}),

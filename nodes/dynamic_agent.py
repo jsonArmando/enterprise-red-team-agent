@@ -175,6 +175,9 @@ class LLMDecisionEngine:
             "crea una capacidad nueva o cambia materialmente el estado. No asumas que una herramienta o categoría queda completada "
             "tras una sola ejecución. Elige entre varias acciones plausibles según la evidencia actual y adapta la estrategia cuando "
             "aparezca nueva información. No inventes hechos ausentes del estado. "
+            "Usa vulnerability_signals, confidence y expected_information_gain para priorizar hipótesis respaldadas por evidencia. "
+            "Una señal fuerte de exposición de políticas o artefactos debe llevar a inspeccionar y comprender la evidencia recién obtenida "
+            "antes de volver a enumerar superficies genéricas, salvo que otra hipótesis tenga evidencia objetivamente más fuerte. "
             "Responde EXCLUSIVAMENTE en un formato JSON válido (sin bloques de código markdown adicionales) con esta estructura exacta:\n"
             "{\n"
             '  "thought": "Análisis táctico detallado justificando el siguiente paso técnico",\n'

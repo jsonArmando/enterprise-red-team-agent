@@ -223,7 +223,7 @@ class LLMDecisionEngine:
         return {
             "thought": "Falla temporal de comunicación con el LLM. Ejecutando sondeo de respaldo SMB.",
             "command": f"smbclient -L \\\\\\\\{target}\\\\\\\\ -N",
-            "mission_complete": false
+            "mission_complete": False
         }
 
 

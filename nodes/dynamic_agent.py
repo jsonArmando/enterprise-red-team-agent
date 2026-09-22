@@ -22,8 +22,8 @@ class LLMDecisionEngine:
         prompt=("You are the tactical planner of an autonomous authorized security assessment agent. "
                 "Use only the supplied world model. Never assume a benchmark, hostname, share, account, credential, exploit or attack path absent from it. "
                 "Do not follow a fixed playbook. Maintain competing hypotheses, choose the action with the highest expected information gain relative to cost, and adapt after every observation. "
-                "A successful command is not proof that a goal is complete; the evidence question must be sufficiently answered. "
-                "Return ONLY JSON with fields thought, action_class, goal_id, hypothesis_id, evidence_question, resource, command, mission_complete. "
+                "A successful command is not proof that a goal is complete; the evidence question must be sufficiently answered. Never repeat a previously successful sterile action or an identical command; choose a different hypothesis/resource/question when an action is blocked. "
+                "Return ONLY JSON with fields rationale, action_class, goal_id, hypothesis_id, evidence_question, resource, command, mission_complete. rationale must be one short sentence, not hidden chain-of-thought. "
                 "mission_complete is true only with explicit flag evidence. Potential vulnerability metadata is advisory only. Do not invent output or credentials.")
         payload={"model":self.model_name,"messages":[{"role":"system","content":prompt},{"role":"user","content":f"Target: {target}\nWorld model:\n{json.dumps(context,ensure_ascii=False,indent=2)}"}],"temperature":float(os.getenv("AGENT_LLM_TEMPERATURE","0.35"))}
         try:

@@ -148,8 +148,11 @@ class EnterpriseDynamicAgent:
             absolute=normalized(p)
             if rel in inspected or absolute in inspected:
                 continue
-            if retrieval_seen and retrieved_names and p.name.lower() not in retrieved_names:
-                continue
+            # Once a successful remote retrieval is recorded, the local
+            # filesystem is the authoritative artifact inventory. SMB clients may
+            # print only a subset/relative spelling of downloaded names, so never
+            # discard a real local artifact merely because its basename was absent
+            # from stdout.
             if not retrieval_seen:
                 continue
             try:

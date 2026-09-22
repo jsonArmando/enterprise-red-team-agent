@@ -81,7 +81,11 @@ class ReasoningState:
 
     @staticmethod
     def action_intent(command: str) -> str:
-        """Canonicalize command variants into a generic semantic intent."""
+        """Canonicalize commands into semantic intent + resource scope.
+
+        The scope keeps different SMB resources distinguishable while still
+        preventing sterile re-enumeration of the same surface.
+        """
         text = re.sub(r"\s+", " ", str(command or "").strip().lower())
         if not text:
             return "empty"
@@ -91,9 +95,50 @@ class ReasoningState:
             return "inspect_local_artifact"
         if any(x in text for x in ("get ", "mget ", "wget ", "curl ", "download")):
             return "retrieve_remote_artifact"
+        if "smbclient" in text:
+            resource = "server"
+            m = re.search(r"smbclient\\s+[^ ]*//[^/\\s]+/([^\\s'\"]+)", text)
+            if not m:
+                m = re.search(r"//[^/\\s]+/([^\\s'\"]+)", text)
+            if m:
+                resource = re.sub(r"[^a-z0-9_.-]", "", m.group(1)) or "server"
+            return f"inspect_smb_resource:{resource}"
         if any(x in text for x in ("ldapsearch", "rpcclient", "enum4linux", "smbmap")):
             return "enumerate_remote_surface"
         return text[:180]
+
+    @staticmethod
+    def extract_entities(output: str) -> Dict[str, List[str]]:
+        """Extract stable resource/identity names without target-specific assumptions."""
+        text = str(output or "")
+        entities = {"identities": [], "groups": [], "shares": [], "artifacts": [], "services": []}
+        patterns = {
+            "identities": (r"(?im)^\\s*(?:user|username|account|sAMAccountName)\\s*[:=]\\s*([A-Za-z0-9_.@\\\\-]+)",),
+            "groups": (r"(?im)^\\s*(?:group|groupname|cn)\\s*[:=]\\s*([A-Za-z0-9_.@\\\\-]+)",),
+            "shares": (r"(?im)^\\s*([A-Za-z0-9$_.-]{2,})\\s+(?:Disk|IPC|Printer|Remote|Special|Unknown)\\b",),
+            "artifacts": (r"(?im)\\b([A-Za-z0-9_.-]+\\.(?:xml|ini|conf|config|txt|json|pcap))\\b",),
+            "services": (r"(?im)\\b([A-Za-z0-9_.-]+/(?:[A-Za-z0-9_.-]+))\\b",),
+        }
+        for kind, pats in patterns.items():
+            for pat in pats:
+                entities[kind].extend(re.findall(pat, text))
+        return {k: ReasoningState._unique(v, 64) for k, v in entities.items()}
+
+    @classmethod
+    def derive_resources(cls, history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Track discovered resources and whether they have been inspected."""
+        resources = {}
+        for h in history[-64:]:
+            output = str(h.get("output", ""))
+            entities = cls.extract_entities(output)
+            for share in entities["shares"]:
+                key = share.lower()
+                resources.setdefault(key, {"name": share, "type": "share", "observed_steps": [], "inspected_steps": []})
+                resources[key]["observed_steps"].append(h.get("step"))
+                if "smbclient" in str(h.get("command", "")).lower():
+                    resources[key]["inspected_steps"].append(h.get("step"))
+        return list(resources.values())[-64:]
+
     @staticmethod
     def generate_hypotheses(facts: List[str], capabilities: List[str]) -> List[Dict[str, Any]]:
         hypotheses = []
@@ -164,6 +209,8 @@ class ReasoningState:
         capabilities = self.derive_capabilities(facts, history)
         hypotheses = self.generate_hypotheses(facts, capabilities)
         goals = self.generate_goals(hypotheses, capabilities)
+        entities = self.extract_entities(output)
+        resources = self.derive_resources(history + [{"output": output, "command": history[-1].get("command", "") if history else "", "step": history[-1].get("step") if history else None}])
 
         old_fact_set = {x.lower() for x in old_facts}
         newly_observed = [x for x in new_facts if x.lower() not in old_fact_set]
@@ -173,6 +220,8 @@ class ReasoningState:
             "capabilities": capabilities,
             "hypotheses": hypotheses,
             "candidate_goals": goals,
+            "entities": entities,
+            "resources": resources,
         }
 
     def context(self) -> Dict[str, Any]:
@@ -182,4 +231,6 @@ class ReasoningState:
             "hypotheses": self.old.get("hypotheses", [])[:12],
             "candidate_goals": self.old.get("candidate_goals", [])[:16],
             "new_facts": self.old.get("new_facts", [])[:32],
+            "entities": self.old.get("entities", {}),
+            "resources": self.old.get("resources", [])[-64:],
         }

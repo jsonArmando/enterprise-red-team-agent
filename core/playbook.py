@@ -5,6 +5,8 @@ from pathlib import Path
 
 STOP = ("__STOP__", "stop")
 
+OSTICKET_PATHS = "/ /scp /open.php /login.php /tickets.php /kb/faq.php"
+
 
 class LabPlaybook:
     def __init__(self, ip: str, workdir: Path):
@@ -42,6 +44,31 @@ class LabPlaybook:
             return (f"nmap -Pn -T4 --top-ports 200 -sV --open -oN {self.scans}/quick_scan.txt {ip}", "recon")
         if not (self.scans / "version_scan.txt").exists():
             return (f"nmap -Pn -sC -sV -p- --min-rate 800 -oN {self.scans}/version_scan.txt {ip}", "recon")
+
+        # --- Phase 1 web / osTicket (before long AD enum) ---
+        if web and not self._done(history, "web_headers.txt"):
+            return (
+                f"curl -skI --max-time 12 http://{ip} -o {self.loot}/web_headers.txt; "
+                f"curl -skI --max-time 12 https://{ip} >> {self.loot}/web_headers.txt || true",
+                "recon",
+            )
+        if web and not self._done(history, "web_index.html"):
+            return (
+                f"curl -skL --max-time 15 http://{ip}/ -o {self.loot}/web_index.html; "
+                f"grep -iE 'osticket|support ticket|helpdesk|nginx|apache|title' "
+                f"{self.loot}/web_index.html {self.loot}/web_headers.txt | head -40 || true",
+                "recon",
+            )
+        if web and not self._done(history, "osticket_probe"):
+            return (
+                f"echo osticket_probe > /dev/null; "
+                f"for p in {OSTICKET_PATHS}; do "
+                f"code=$(curl -skI --max-time 8 -o /dev/null -w '%{{http_code}}' http://{ip}$p); "
+                f"echo \"$p $code\"; done | tee {self.loot}/osticket_paths.txt",
+                "recon",
+            )
+        if web and not self._done(history, "whatweb"):
+            return (f"whatweb -a 3 --color=never http://{ip} 2>/dev/null | tee {self.loot}/whatweb.txt || true", "recon")
 
         if ad and not self._done(history, "-u '' -p ''"):
             return (f"nxc smb {ip} -u '' -p '' --shares", "enum")
@@ -107,8 +134,6 @@ class LabPlaybook:
 
         if mssql and not self._done(history, "nxc mssql"):
             return (f"nxc mssql {ip} -u sa -p sa --local-auth || true", "enum")
-        if web and not self._done(history, "curl -sI"):
-            return (f"curl -sI --max-time 10 http://{ip} || true", "enum")
         if web and not self._done(history, "gobuster"):
             w = "/usr/share/wordlists/dirb/common.txt"
             if not Path(w).exists():

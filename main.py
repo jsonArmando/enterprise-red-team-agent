@@ -151,11 +151,15 @@ class EnterpriseDynamicAgent:
             output=verify_flags_remote(self.target)
 
         elif action=="replan":
-            output=json.dumps({
-                "unresolved": [v for v in state.get("vulnerabilities",[]) if v.get("validation")!="rejected" and v.get("exploit_status")!="confirmed"],
-                "failed_paths":state.get("failed_paths",[]),
-                "objective":state.get("objective"),
-            },ensure_ascii=False)
+            round_no=int(state.get("replan_round",0))+1
+            out_file=self.workdir/"scans"/f"adaptive_recon_{round_no}.txt"
+            output=run_recon(self.target,out_file)
+            state["replan_round"]=round_no
+            state["recon_complete"]=True
+            state["vulnerability_scan_complete"]=False
+            state["discovered_services"] = list(dict.fromkeys((state.get("discovered_services",[]) + [line for line in output.splitlines() if "/tcp" in line and "open" in line])))
+            state.setdefault("evidence_ledger",[]).append({"source_tool":"adaptive_recon","confidence":0.8,"verified":False,"raw_output":output[:12000]})
+            self.build_potential_exploits(state)
 
         else:
             raise ValueError(f"unsupported_action:{action}")

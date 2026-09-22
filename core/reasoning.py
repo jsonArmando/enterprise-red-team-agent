@@ -172,6 +172,69 @@ class ReasoningState:
         return hypotheses[:12]
 
     @staticmethod
+    def score_hypotheses(
+        hypotheses: List[Dict[str, Any]],
+        capabilities: List[str],
+        history: List[Dict[str, Any]],
+        old: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Rank hypotheses by evidence gain, novelty, and recent stagnation.
+
+        This is a lightweight best-first controller inspired by search-based
+        agent planning: the LLM proposes tactics, while explicit state decides
+        which hypothesis deserves attention. It does not encode a target path.
+        """
+        scores = dict(old.get("hypothesis_scores") or {})
+        recent = history[-12:]
+        for h in hypotheses:
+            hid = h.get("id")
+            if not hid:
+                continue
+            previous = dict(scores.get(hid) or {})
+            tests = int(previous.get("tests", 0))
+            progress = int(previous.get("progress_events", 0))
+            no_progress = int(previous.get("no_progress", 0))
+            matched = sum(
+                1 for entry in recent
+                if hid in str(entry.get("hypothesis_id", ""))
+            )
+            tests += matched
+            if recent and matched:
+                for entry in recent:
+                    if hid in str(entry.get("hypothesis_id", "")) and entry.get("no_new_evidence") is False:
+                        progress += 1
+                    elif hid in str(entry.get("hypothesis_id", "")):
+                        no_progress += 1
+            # Reward unexplored hypotheses and recent evidence; penalize sterile tests.
+            score = 1.0 + (2.0 if tests == 0 else 0.0) + (1.5 * progress) - (1.25 * no_progress)
+            score += min(2.0, 0.25 * len(capabilities))
+            scores[hid] = {
+                "score": round(max(0.0, score), 3),
+                "tests": tests,
+                "progress_events": progress,
+                "no_progress": no_progress,
+                "status": "promising" if score >= 2.0 else "deprioritized",
+            }
+        ranked = []
+        for h in hypotheses:
+            item = dict(h)
+            item["control"] = scores.get(h.get("id"), {})
+            ranked.append(item)
+        return sorted(ranked, key=lambda x: x.get("control", {}).get("score", 0), reverse=True)[:12]
+
+    @staticmethod
+    def control_signal(hypotheses: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not hypotheses:
+            return {"mode": "explore", "reason": "no_hypotheses"}
+        top = hypotheses[0].get("control", {})
+        sterile = int(top.get("no_progress", 0))
+        if sterile >= 3:
+            return {"mode": "switch_hypothesis", "reason": "hypothesis_sterile", "hypothesis": hypotheses[0].get("id")}
+        if int(top.get("tests", 0)) >= 4 and int(top.get("progress_events", 0)) == 0:
+            return {"mode": "switch_hypothesis", "reason": "low_information_gain", "hypothesis": hypotheses[0].get("id")}
+        return {"mode": "continue", "reason": "expected_information_gain", "hypothesis": hypotheses[0].get("id")}
+
+    @staticmethod
     def generate_goals(hypotheses: List[Dict[str, Any]], capabilities: List[str]) -> List[Dict[str, Any]]:
         goals = []
         seen = set()
@@ -208,6 +271,8 @@ class ReasoningState:
         facts = self._unique(old_facts + new_facts, 256)
         capabilities = self.derive_capabilities(facts, history)
         hypotheses = self.generate_hypotheses(facts, capabilities)
+        hypotheses = self.score_hypotheses(hypotheses, capabilities, history, self.old)
+        control = self.control_signal(hypotheses)
         goals = self.generate_goals(hypotheses, capabilities)
         entities = self.extract_entities(output)
         resources = self.derive_resources(history + [{"output": output, "command": history[-1].get("command", "") if history else "", "step": history[-1].get("step") if history else None}])
@@ -219,6 +284,8 @@ class ReasoningState:
             "new_facts": newly_observed[:32],
             "capabilities": capabilities,
             "hypotheses": hypotheses,
+            "hypothesis_scores": {h.get("id"): h.get("control", {}) for h in hypotheses if h.get("id")},
+            "control_signal": control,
             "candidate_goals": goals,
             "entities": entities,
             "resources": resources,
@@ -229,6 +296,8 @@ class ReasoningState:
             "facts": self.old.get("facts", [])[-64:],
             "capabilities": self.old.get("capabilities", []),
             "hypotheses": self.old.get("hypotheses", [])[:12],
+            "hypothesis_scores": self.old.get("hypothesis_scores", {}),
+            "control_signal": self.old.get("control_signal", {"mode": "explore"}),
             "candidate_goals": self.old.get("candidate_goals", [])[:16],
             "new_facts": self.old.get("new_facts", [])[:32],
             "entities": self.old.get("entities", {}),

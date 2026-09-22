@@ -91,15 +91,69 @@ class EnterpriseDynamicAgent:
             except (OSError,UnicodeError): continue
         return sorted(set(found))
 
-    def autonomous_fallback(self,state):
+    def load_potential_exploit(self):
+        """Carga candidatos de SearchSploit como metadata; nunca los trata como comandos ejecutables."""
+        paths=(Path(f"testing/{self.target_ip}/loot/potential_exploits.json"),Path(f"testing/{self.target_ip}/potential_exploits.json"),Path("potential_exploits.json"))
+        for path in paths:
+            if not path.exists():
+                continue
+            try:
+                data=json.loads(path.read_text(encoding="utf-8"))
+                candidates=[]
+                groups=data if isinstance(data,dict) else {"unknown":data}
+                for service,value in groups.items():
+                    if not isinstance(value,list):
+                        continue
+                    for item in value:
+                        if isinstance(item,dict):
+                            candidates.append({"service":service,"title":item.get("Title") or item.get("title","") ,"path":item.get("Path") or item.get("path","") ,"codes":item.get("Codes") or item.get("codes","")})
+                        elif isinstance(item,str):
+                            candidates.append({"service":service,"title":item,"path":"","codes":""})
+                if candidates:
+                    return {"available":True,"source":str(path),"candidate_count":len(candidates),"candidates":candidates[:12]}
+            except (OSError,json.JSONDecodeError) as exc:
+                logger.warning("[!] No se pudo leer %s: %s",path,exc)
+        return {"available":False,"source":"","candidate_count":0,"candidates":[]}
+
+    @staticmethod
+    def action_family(command):
+        text=re.sub(r"\\s+"," ",command.lower().strip())
+        if any(x in text for x in ("--users","enumdomusers","enumerate users")):
+            return "enumerate_domain_users"
+        if any(x in text for x in ("--groups","enumdomgroups","enumerate groups")):
+            return "enumerate_domain_groups"
+        if any(x in text for x in ("--shares","smbclient -l","smbmap","smbclient -l")):
+            return "enumerate_smb_shares"
+        if "replication" in text and ("smbclient" in text or "mget" in text):
+            return "retrieve_replication_artifacts"
+        if "groups.xml" in text or "gpp-decrypt" in text:
+            return "analyze_gpp_artifacts"
+        if "getuserspns" in text or "kerberoast" in text:
+            return "kerberos_spn_enumeration"
+        if "getnpusers" in text or "asreproast" in text:
+            return "asrep_enumeration"
+        if "bloodhound" in text:
+            return "ad_graph_collection"
+        if "secretsdump" in text:
+            return "credential_dump_analysis"
+        return re.sub(r"\\s+"," ",text)[:160]
+
+    def semantic_repeats(self,history,command):
+        family=self.action_family(command)
+        return sum(self.action_family(h.get("command",""))==family for h in history if h.get("command"))
+
+    def autonomous_fallback(self,state,potential_exploit=None):
         history=state.get("history",[]); blocked=[]
         for h in history[-12:]:
             cmd=h.get("command","")
             if cmd: blocked.append(re.sub(r"\s+"," ",cmd.strip()))
         planner=LLMDecisionEngine(); augmented_history=list(history)
-        augmented_history.append({"step":state.get("step_count",0),"command":"[PLANNER]","output":"No hay flag todavía. Debes continuar la auditoría. NO declares mission_complete hasta detectar una flag. Comandos ya ejecutados y que NO debes repetir exactamente: "+json.dumps(blocked)})
+        planner_context=("No hay flag todavía. Debes continuar la auditoría. NO declares mission_complete hasta detectar una flag. Comandos ya ejecutados y que NO debes repetir exactamente: "+json.dumps(blocked)+"\\n")
+        if potential_exploit and potential_exploit.get("available"):
+            planner_context += ("Existe potential_exploit como metadata de candidatos. Debes validar aplicabilidad contra la evidencia antes de proponer cualquier acción; NO trates campos de SearchSploit como comandos ejecutables. Candidatos: "+json.dumps(potential_exploit,ensure_ascii=False)[:6000])
+        augmented_history.append({"step":state.get("step_count",0),"command":"[PLANNER]","output":planner_context})
         for _ in range(3):
-            decision=planner.consult_tactical_next_step(self.target_ip,augmented_history,state.get("last_output",""))
+            decision=planner.consult_tactical_next_step(self.target_ip,augmented_history,state.get("last_output",""),potential_exploit=potential_exploit)
             cmd=CommandSanitizer.clean(decision.get("command",""))
             if not cmd: continue
             normalized=re.sub(r"\s+"," ",cmd.strip())
@@ -109,20 +163,8 @@ class EnterpriseDynamicAgent:
 
     def determine_next_action(self,state):
         history=state.get("history",[]); commands=[h.get("command","") for h in history]
-        report_paths=(Path(f"testing/{self.target_ip}/loot/potential_exploits.json"),Path(f"testing/{self.target_ip}/potential_exploits.json"),Path("potential_exploits.json"))
-        for raw_path in report_paths:
-            if not raw_path.exists():continue
-            try:
-                data=json.loads(raw_path.read_text(encoding="utf-8"))
-                items=[]
-                if isinstance(data,list):items=data
-                elif isinstance(data,dict):
-                    for value in data.values():
-                        if isinstance(value,list):items.extend(value)
-                for item in items:
-                    cmd=item if isinstance(item,str) else (item.get("command") or item.get("exec") or item.get("exploit") or item.get("payload"))
-                    if cmd and cmd not in commands:return cmd,"exploitation","json_exploit"
-            except (OSError,json.JSONDecodeError):pass
+        potential=self.load_potential_exploit()
+        self.current_potential_exploit=potential
 
         scan=self.scan_path()
         if not scan.exists():
@@ -135,7 +177,8 @@ class EnterpriseDynamicAgent:
         creds=self.parse_loot_for_credentials()
         if creds["username"] and creds["password"] and not any("secretsdump" in c for c in commands):
             return f"impacket-secretsdump {domain}/{creds['username']}:{creds['password']}@{self.target_ip}","post-exploitation","post.secretsdump"
-        fallback=self.autonomous_fallback(state)
+        planner_state={**state,"potential_exploit":potential}
+        fallback=self.autonomous_fallback(planner_state,potential_exploit=potential)
         if fallback:return fallback
         return "","autonomous","planner.stalled"
 
@@ -151,14 +194,15 @@ class EnterpriseDynamicAgent:
                 logger.warning("[!] Planner sin acción nueva; se reintentará con contexto actualizado."); time.sleep(2); continue
             attempts=state.get("action_attempts",{}).get(action_id,0); recent=state.get("history",[]); fp=self.fingerprint(command)
             repeats=sum(self.fingerprint(h.get("command",""))==fp for h in recent[-6:])
-            if attempts>=MAX_SAME_ACTION_ATTEMPTS or repeats>=MAX_SAME_ACTION_ATTEMPTS:
+            semantic_repeats=self.semantic_repeats(recent,command)
+            if attempts>=MAX_SAME_ACTION_ATTEMPTS or repeats>=MAX_SAME_ACTION_ATTEMPTS or semantic_repeats>=MAX_SAME_ACTION_ATTEMPTS:
                 logger.warning("[!] Acción repetida bloqueada: %s. Se fuerza replanning autónomo.",action_id)
                 state.setdefault("history",[]).append({"step":self.current_step,"command":"[BLOCKED_DUPLICATE]","output":f"Acción bloqueada: {command}"})
                 self.state_manager.save_state(self.current_step,state["history"][-1],"autonomous",False); self.current_step+=1; continue
             logger.info("[*] Paso %d/%d | %s | %s",self.current_step,MAX_STEPS,action_id,command)
             result=self.executor.execute_with_polling(command); output=result.get("stdout","")
             if result.get("stderr"):output+="\nSTDERR:\n"+result["stderr"]
-            self.state_manager.save_state(self.current_step,{"step":self.current_step,"action_id":action_id,"command":command,"output":output[:8000],"status":result.get("status"),"returncode":result.get("returncode")},phase,False,extra={"last_action_id":action_id,"last_command_fingerprint":fp,"action_attempts":{**state.get("action_attempts",{}),action_id:attempts+1}})
+            self.state_manager.save_state(self.current_step,{"step":self.current_step,"action_id":action_id,"command":command,"output":output[:8000],"status":result.get("status"),"returncode":result.get("returncode")},phase,False,extra={"last_action_id":action_id,"last_command_fingerprint":fp,"action_attempts":{**state.get("action_attempts",{}),action_id:attempts+1},"potential_exploit":getattr(self,"current_potential_exploit",{"available":False,"candidate_count":0,"candidates":[]})})
             self.current_step+=1; time.sleep(1)
         logger.warning("[!] Límite de seguridad de %d pasos alcanzado sin flag; la misión NO se marca como completada.",MAX_STEPS)
 

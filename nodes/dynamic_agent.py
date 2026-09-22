@@ -304,7 +304,7 @@ def dynamic_redteam_node(state: Dict[str, Any]) -> Dict[str, Any]:
             
         thought = decision.get("thought", "Razonamiento autónomo ejecutado con éxito.")
         mission_complete = bool(decision.get("mission_complete", False))
-        flag_re = re.compile(r"(?:flag|htb)\\{[^}]{4,200}\\}", re.I)
+        flag_re = re.compile(r"(?:flag|htb)\{[^}]{4,200}\}", re.I)
         flag_evidence = bool(flag_re.search(last_output or ""))
         loot_root = os.path.join(target_dir, "loot")
         if os.path.isdir(loot_root):
@@ -330,10 +330,42 @@ def dynamic_redteam_node(state: Dict[str, Any]) -> Dict[str, Any]:
     execution_result = last_output
     if command_to_execute and not mission_complete:
         clean_cmd = CommandSanitizer.clean(command_to_execute)
-        
+        normalized_cmd = re.sub(r"\s+", " ", clean_cmd.strip())
+        recent_normalized = {
+            re.sub(r"\s+", " ", str(h.get("command", "")).strip())
+            for h in history[-6:]
+            if h.get("command") and not str(h.get("command", "")).startswith("[")
+        }
+        planner_state = dict(state.get("planner_state") or {})
+        if normalized_cmd in recent_normalized:
+            stalls = int(planner_state.get("stalled_attempts", 0)) + 1
+            history.append({
+                "step": step_count,
+                "command": "[BLOCKED_DUPLICATE]",
+                "thought": "Supervisor bloqueó una acción repetida sin evidencia nueva.",
+                "output": "Duplicate action blocked."
+            })
+            planner_state.update({"status": "STALLED", "stalled_attempts": stalls, "last_reason": "duplicate_action"})
+            updated_state = {
+                **state,
+                "step_count": step_count,
+                "mission_complete": False,
+                "last_output": "Supervisor blocked repeated action.",
+                "history": [redact_secrets(h) for h in history],
+                "planner_state": planner_state
+            }
+            if stalls >= 3:
+                planner_state["status"] = "EXHAUSTED"
+                planner_state["last_reason"] = "duplicate_action_budget_exhausted"
+                updated_state["planner_state"] = planner_state
+                logger.error("[!] [Supervisor] Presupuesto de acciones repetidas agotado; deteniendo legacy node.")
+            save_persistent_state(updated_state)
+            return updated_state
+
         if not CommandSanitizer.validate_command_safety(clean_cmd):
-            logger.error("[-] Operación abortada por fallas en validación de seguridad de comandos.")
-            updated_state = {**state, "step_count": step_count, "mission_complete": True}
+            logger.error("[-] Operación abortada por política de seguridad; no se marca la misión como completada.")
+            updated_state = {**state, "step_count": step_count, "mission_complete": False,
+                             "planner_state": {**planner_state, "status": "EXHAUSTED", "last_reason": "command_policy_blocked"}}
             save_persistent_state(updated_state)
             return updated_state
 

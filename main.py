@@ -288,6 +288,7 @@ class EnterpriseDynamicAgent:
                 logger.exception("[!] Planner exception: %s",exc)
                 break
             cmd=CommandSanitizer.clean(str(decision.get("command","") or ""))
+            selected_hypothesis=str(decision.get("hypothesis_id","") or "").strip()
             if not cmd:
                 augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_EMPTY]","output":"El planner no propuso una acción."})
                 continue
@@ -300,6 +301,7 @@ class EnterpriseDynamicAgent:
                 blocked_actions.add(action_id)
                 augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_DUPLICATE]","output":f"Comando ya ejecutado: {cmd}"})
                 continue
+            self._selected_hypothesis_id = selected_hypothesis
             return cmd,"autonomous",action_id
         stalled=int(planner_state.get("stalled_attempts",0))+1
         updated=self.persist_planner_state(
@@ -387,7 +389,7 @@ class EnterpriseDynamicAgent:
             if result.get("stderr"):output+="\nSTDERR:\n"+result["stderr"]
             output_digest=hashlib.sha256(re.sub(r"\s+"," ",output).encode("utf-8",errors="ignore")).hexdigest()[:16] if output else ""
             action_intent=ReasoningState.action_intent(command)
-            raw_entry={"step":self.current_step,"action_id":action_id,"action_intent":action_intent,"command":command,"output":output[:8000],"output_digest":output_digest,"status":result.get("status"),"returncode":result.get("returncode")}
+            raw_entry={"step":self.current_step,"action_id":action_id,"action_intent":action_intent,"hypothesis_id":getattr(self,"_selected_hypothesis_id",""),"command":command,"output":output[:8000],"output_digest":output_digest,"status":result.get("status"),"returncode":result.get("returncode")}
             autonomy_update=self.autonomy.observe(state, raw_entry)
             raw_entry["no_new_evidence"]=not bool(autonomy_update.get("last_progress"))
             reasoning_update=self.reasoning.update(output, state.get("history",[]) + [raw_entry])

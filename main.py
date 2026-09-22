@@ -61,8 +61,44 @@ class EnterpriseDynamicAgent:
         self.reasoning=ReasoningState(state); c=self.reasoning.context()
         return {"facts":c.get("facts",[])[-80:],"new_facts":c.get("new_facts",[])[-40:],"capabilities":c.get("capabilities",[]),"hypotheses":c.get("hypotheses",[])[:16],"candidate_goals":c.get("candidate_goals",[])[:16],"vulnerability_signals":c.get("vulnerability_signals",{}),"resources":c.get("resources",[])[-80:],"control_signal":c.get("control_signal",{}),"hypothesis_control":c.get("hypothesis_control",{})}
 
+    def _action_signature(self, decision):
+        command = CommandSanitizer.clean(str(decision.get("command") or ""))
+        return {
+            "intent": ReasoningState.action_intent(command),
+            "action_class": self._norm(decision.get("action_class")),
+            "resource": self._norm(decision.get("resource")),
+            "command": self._norm(command),
+        }
+
+    def _recent_blocked_actions(self,state):
+        blocked=[]
+        for h in state.get("history",[])[-20:]:
+            if h.get("event_type")!="action" or h.get("returncode")!=0:
+                continue
+            if h.get("no_new_evidence") is True:
+                blocked.append({
+                    "intent": ReasoningState.action_intent(h.get("command","")),
+                    "action_class": self._norm(h.get("action_class")),
+                    "resource": self._norm(h.get("resource")),
+                    "command": self._norm(h.get("command")),
+                    "reason": "previous successful action produced no new evidence",
+                })
+        return blocked[-12:]
+
+    def _is_sterile_repeat(self,state,decision):
+        sig=self._action_signature(decision)
+        for h in reversed(state.get("history",[])[-20:]):
+            if h.get("event_type")!="action" or h.get("returncode")!=0:
+                continue
+            prior={"intent":ReasoningState.action_intent(h.get("command","")),"action_class":self._norm(h.get("action_class")),"resource":self._norm(h.get("resource")),"command":self._norm(h.get("command"))}
+            if sig["command"]==prior["command"]:
+                return True
+            if sig["intent"]==prior["intent"] and sig["resource"]==prior["resource"] and h.get("no_new_evidence") is True:
+                return True
+        return False
+
     def _context(self,state):
-        return {"world":self._world(state),"recent_actions":[{k:h.get(k) for k in ("step","action_class","goal_id","hypothesis_id","evidence_question","resource","command","returncode","evidence_delta","capability_delta","no_new_evidence")} for h in state.get("history",[])[-12:] if h.get("event_type")=="action"],"mission":{"complete":bool(state.get("mission_complete")),"progress_streak":int((state.get("planner_state") or {}).get("no_progress_streak",0))}}
+        return {"world":self._world(state),"recent_actions":[{k:h.get(k) for k in ("step","action_class","goal_id","hypothesis_id","evidence_question","resource","command","returncode","evidence_delta","capability_delta","no_new_evidence")} for h in state.get("history",[])[-12:] if h.get("event_type")=="action"],"blocked_actions":self._recent_blocked_actions(state),"mission":{"complete":bool(state.get("mission_complete")),"progress_streak":int((state.get("planner_state") or {}).get("no_progress_streak",0))}}
 
     def _block(self,state,reason,decision=None):
         entry={"event_type":"planner_rejection","step":self.current_step,"reason":reason,"decision":decision or {}}
@@ -85,6 +121,10 @@ class EnterpriseDynamicAgent:
                 self._block(state,"mission_complete_without_flag",d); continue
             if not d["command"]: self._block(state,"empty_action",d); continue
             if not CommandSanitizer.validate_command_safety(d["command"]): self._block(state,"execution_policy_rejected",d); continue
+            if self._is_sterile_repeat(state,d):
+                self._block(state,"sterile_semantic_repeat",d)
+                context["blocked_actions"]=self._recent_blocked_actions({**state,"history":list(state.get("history",[]))+[{"event_type":"action","command":d["command"],"action_class":d.get("action_class"),"resource":d.get("resource"),"returncode":0,"no_new_evidence":True}]})
+                continue
             valid={str(h.get("id")) for h in context["world"].get("hypotheses",[]) if h.get("id")}; hid=str(d.get("hypothesis_id") or "")
             if hid and valid and hid not in valid: self._block(state,"unknown_hypothesis",d); continue
             return d
@@ -116,7 +156,10 @@ class EnterpriseDynamicAgent:
                 return
             key=self._norm(f"{d.get('goal_id','')}|{d.get('evidence_question','')}|{d.get('resource','')}")
             duplicate=any(key==self._norm(f"{h.get('goal_id','')}|{h.get('evidence_question','')}|{h.get('resource','')}") and h.get("returncode")==0 and h.get("no_new_evidence") is False for h in state.get("history",[])[-12:])
-            if duplicate and d.get("action_class")!="inspect_artifact": self._block(state,"semantic_evidence_question_already_answered",d); self.current_step+=1; continue
+            if duplicate and d.get("action_class")!="inspect_artifact":
+                self._block(state,"semantic_evidence_question_already_answered",d); self.current_step+=1; continue
+            if self._is_sterile_repeat(state,d):
+                self._block(state,"sterile_semantic_repeat",d); self.current_step+=1; continue
             logger.info("[*] Paso %d/%s | %s | %s",self.current_step,MAX_STEPS or "∞",d.get("action_class","action"),d["command"])
             if not CommandSanitizer.validate_command_safety(d["command"]): self._block(state,"execution_policy_rejected",d); return
             entry=self._execute(state,d); ps=dict(state.get("planner_state") or {}); streak=int(ps.get("no_progress_streak",0)); streak=streak+1 if entry.get("no_new_evidence") else 0

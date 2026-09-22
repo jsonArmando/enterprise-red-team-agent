@@ -15,6 +15,7 @@ from core.intel import merge_intel, parse_loot_files, parse_output, persist_inte
 from core.playbook import LabPlaybook
 from core.policy_engine import evaluate_policy
 from core.state_manager import StateManager
+from utils.exploit_matcher import ExploitMatcher
 from utils.smart_executor import SmartCommandExecutor
 
 DOMAIN_RE = re.compile(r"(\b[a-zA-Z0-9-]+\.(?:htb|lab|local|lan|internal)\b)", re.I)
@@ -45,9 +46,7 @@ def inject_domain(domain: str | None, command: str) -> str:
         return command.replace(" -d detected.htb", "").replace("detected.htb/", "/")
     parts = domain.split(".")
     dc = ",".join(f"DC={p}" for p in parts)
-    return (
-        command.replace("detected.htb", domain).replace("DC=detected,DC=htb", dc)
-    )
+    return command.replace("detected.htb", domain).replace("DC=detected,DC=htb", dc)
 
 
 def write_flags(loot: Path, status: dict) -> None:
@@ -62,6 +61,18 @@ def write_flags(loot: Path, status: dict) -> None:
                 indent=2,
             )
         )
+
+
+def maybe_match_cves(target: str, scans_dir: Path, loot: Path) -> None:
+    report = loot / "potential_exploits.json"
+    scan = scans_dir / "version_scan.txt"
+    if report.exists() or not scan.exists():
+        return
+    text = scan.read_text(errors="ignore")
+    if "open" not in text:
+        return
+    hits = ExploitMatcher(target).analyze_scan_output(text)
+    logger.info("[+] CVE candidates services=%s", list(hits.keys()))
 
 
 def main():
@@ -84,6 +95,7 @@ def main():
         intel = merge_intel(state, parse_loot_files(sm.loot_dir))
         state.update(intel)
         persist_intel(sm.loot_dir, intel)
+        maybe_match_cves(target, sm.scans_dir, sm.loot_dir)
 
         status = mission_status([h.get("output", "") for h in state.get("history", [])], sm.loot_dir)
         write_flags(sm.loot_dir, status)
@@ -94,7 +106,7 @@ def main():
 
         cmd, phase = playbook.next_action(state)
         if cmd == "__STOP__" or phase == "stop":
-            logger.info("[*] playbook finished (no echo loop). state=%s", sm.state_file)
+            logger.info("[*] playbook finished. exploits=%s", sm.loot_dir / "potential_exploits.json")
             break
 
         cmd = inject_domain(state.get("domain"), cmd)
@@ -121,6 +133,8 @@ def main():
             state["domain"] = m.group(1).lower()
             sm.update_etc_hosts(state["domain"])
             logger.info("[+] domain %s", state["domain"])
+
+        maybe_match_cves(target, sm.scans_dir, sm.loot_dir)
 
         intel = merge_intel(state, parse_output(output), parse_loot_files(sm.loot_dir))
         state.update(intel)

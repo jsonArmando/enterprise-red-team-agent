@@ -155,7 +155,7 @@ class LLMDecisionEngine:
         self.base_url = os.environ.get("OPENAI_API_BASE", "https://api.x.ai/v1").strip()
         self.model_name = os.environ.get("MODEL_NAME", "grok-3").strip()
 
-    def consult_tactical_next_step(self, target: str, history: List[Dict[str, Any]], last_output: str) -> Dict[str, Any]:
+    def consult_tactical_next_step(self, target: str, history: List[Dict[str, Any]], last_output: str, potential_exploit: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Consulta al LLM estructurando el contexto operativo actual para definir el siguiente comando."""
         if not self.api_key:
             logger.error("[-] [LLMEngine] OPENAI_API_KEY no se encuentra configurada en el entorno.")
@@ -176,15 +176,18 @@ class LLMDecisionEngine:
             '  "command": "Comando exacto de Kali Linux a ejecutar sin comentarios",\n'
             '  "mission_complete": false\n'
             "}"
+            "Regla crítica: los candidatos de potential_exploit requieren validación contra la evidencia; no los trates como comandos por sí mismos.\n"
             "Regla crítica: mission_complete SOLO puede ser true cuando exista evidencia de una FLAG real en la salida o en testing/<target>/loot. Si no hay flag, debes proponer otra acción; no declares la auditoría completada por falta de vectores inmediatos.\n"
         )
 
         # Ventana de contexto optimizada para evitar saturación de tokens
         recent_history = history[-6:] if len(history) > 6 else history
+        potential_context = json.dumps(potential_exploit or {}, ensure_ascii=False)[:6000]
         user_content = (
             f"Objetivo actual: {target}\n"
             f"Historial reciente:\n{json.dumps(recent_history, indent=2)}\n\n"
-            f"Última salida obtenida de Kali Linux (truncada si es muy extensa):\n{last_output[:3000]}"
+            f"Última salida obtenida de Kali Linux (truncada si es muy extensa):\n{last_output[:3000]}\n\n"
+            f"Potential exploit (SOLO metadata/candidatos; nunca asumir que sus campos son comandos ejecutables):\n{potential_context}"
         )
 
         headers = {

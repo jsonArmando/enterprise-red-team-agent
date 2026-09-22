@@ -206,14 +206,62 @@ class ReasoningState:
     @staticmethod
     def control_signal(hypotheses: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not hypotheses:
-            return {"mode": "explore", "reason": "no_hypotheses"}
+            return {"mode": "explore", "reason": "no_hypotheses", "hypothesis": None}
         top = hypotheses[0].get("control", {})
         sterile = int(top.get("no_progress", 0))
+        tests = int(top.get("tests", 0))
+        progress = int(top.get("progress_events", 0))
         if sterile >= 3:
-            return {"mode": "switch_hypothesis", "reason": "hypothesis_sterile", "hypothesis": hypotheses[0].get("id")}
-        if int(top.get("tests", 0)) >= 4 and int(top.get("progress_events", 0)) == 0:
-            return {"mode": "switch_hypothesis", "reason": "low_information_gain", "hypothesis": hypotheses[0].get("id")}
-        return {"mode": "continue", "reason": "expected_information_gain", "hypothesis": hypotheses[0].get("id")}
+            return {"mode": "switch_hypothesis", "reason": "hypothesis_sterile",
+                    "hypothesis": hypotheses[0].get("id")}
+        if tests >= 4 and progress == 0:
+            return {"mode": "switch_hypothesis", "reason": "low_information_gain",
+                    "hypothesis": hypotheses[0].get("id")}
+        return {"mode": "continue", "reason": "expected_information_gain",
+                "hypothesis": hypotheses[0].get("id")}
+
+    @staticmethod
+    def build_hypothesis_control(hypotheses: List[Dict[str, Any]], control_signal: Dict[str, Any], old: Dict[str, Any]) -> Dict[str, Any]:
+        """Runtime-enforced hypothesis lease; the LLM cannot spend attempts on a sterile hypothesis."""
+        previous = dict(old.get("hypothesis_control") or {})
+        leases = dict(previous.get("leases") or {})
+        deprioritized = set(previous.get("deprioritized") or [])
+        exhausted = set(previous.get("exhausted") or [])
+        active = control_signal.get("hypothesis")
+
+        for hypothesis in hypotheses:
+            hid = hypothesis.get("id")
+            if not hid:
+                continue
+            control = hypothesis.get("control", {})
+            tests = int(control.get("tests", 0))
+            sterile = int(control.get("no_progress", 0))
+            progress = int(control.get("progress_events", 0))
+            leases[hid] = {
+                "tests": tests, "progress_events": progress, "no_progress": sterile,
+                "budget": max(0, 3 - sterile), "status": "ACTIVE",
+            }
+            if sterile >= 3 or (tests >= 4 and progress == 0):
+                deprioritized.add(hid)
+                leases[hid]["status"] = "DEPRIORITIZED"
+            elif hid in deprioritized and sterile == 0:
+                deprioritized.discard(hid)
+            if hid == active and hid not in deprioritized:
+                leases[hid]["status"] = "ACTIVE"
+
+        known_ids = {h.get("id") for h in hypotheses}
+        deprioritized &= known_ids
+        exhausted &= known_ids
+        candidates = [h for h in hypotheses if h.get("id") not in deprioritized and h.get("id") not in exhausted]
+        selected = candidates[0].get("id") if candidates else None
+        return {
+            "mode": "switch" if control_signal.get("mode") == "switch_hypothesis" else "continue",
+            "active_hypothesis": selected,
+            "controller_hypothesis": active,
+            "deprioritized": sorted(deprioritized),
+            "exhausted": sorted(exhausted),
+            "leases": leases,
+        }
 
     @staticmethod
     def generate_goals(hypotheses: List[Dict[str, Any]], capabilities: List[str]) -> List[Dict[str, Any]]:
@@ -254,6 +302,7 @@ class ReasoningState:
         hypotheses = self.generate_hypotheses(facts, capabilities)
         hypotheses = self.score_hypotheses(hypotheses, capabilities, history, self.old)
         control = self.control_signal(hypotheses)
+        hypothesis_control = self.build_hypothesis_control(hypotheses, control, self.old)
         goals = self.generate_goals(hypotheses, capabilities)
         entities = self.extract_entities(output)
         resources = self.derive_resources(history + [{"output": output, "command": history[-1].get("command", "") if history else "", "step": history[-1].get("step") if history else None}])
@@ -267,6 +316,7 @@ class ReasoningState:
             "hypotheses": hypotheses,
             "hypothesis_scores": {h.get("id"): h.get("control", {}) for h in hypotheses if h.get("id")},
             "control_signal": control,
+            "hypothesis_control": hypothesis_control,
             "candidate_goals": goals,
             "entities": entities,
             "resources": resources,
@@ -279,6 +329,7 @@ class ReasoningState:
             "hypotheses": self.old.get("hypotheses", [])[:12],
             "hypothesis_scores": self.old.get("hypothesis_scores", {}),
             "control_signal": self.old.get("control_signal", {"mode": "explore"}),
+            "hypothesis_control": self.old.get("hypothesis_control", {}),
             "candidate_goals": self.old.get("candidate_goals", [])[:16],
             "new_facts": self.old.get("new_facts", [])[:32],
             "entities": self.old.get("entities", {}),

@@ -74,6 +74,14 @@ def run_post_exploit(target: str, access: dict[str,Any] | None = None) -> str:
         "target":target,"access":access or {},"mode":"authorized_lab"
     })
 
+def run_privilege_validation(target: str, hypothesis: dict[str,Any]) -> str:
+    return call_kali_mcp_tool(os.getenv("MCP_PRIVESC_VALIDATE_TOOL", "validate_privilege_escalation"), {
+        "target": target,
+        "hypothesis": hypothesis,
+        "evidence_lines": hypothesis.get("evidence_lines", []),
+        "mode": "authorized_lab",
+    })
+
 def run_privilege_escalation(target: str, access: dict[str,Any] | None = None, hypotheses: list[dict[str,Any]] | None = None) -> str:
     return call_kali_mcp_tool(os.getenv("MCP_PRIVESC_TOOL","privilege_escalation"), {
         "target":target,

@@ -14,7 +14,6 @@ logger=logging.getLogger("EnterpriseDynamicAgent")
 MAX_STEPS=None  # Sin límite de pasos; la misión termina al detectar flag o por un safety stop.
 MAX_SAME_ACTION_ATTEMPTS=3
 MAX_PLANNER_RETRIES=2
-MAX_PLANNER_STALLS=3
 MAX_NO_PROGRESS_STREAK=500
 CANONICAL_SCAN="version_scan.txt"
 LEGACY_SCANS=("full_recon.txt",)
@@ -239,7 +238,6 @@ class EnterpriseDynamicAgent:
         executed={re.sub(r"\s+"," ",h.get("command","").strip()) for h in history if h.get("command")}
         planner_state=state.get("planner_state") or {}
         attempted=set(planner_state.get("recovery_attempts",[]))
-        attempted=set(planner_state.get("recovery_attempts",[]))
         scan=self.scan_path()
         scan_text=scan.read_text(encoding="utf-8",errors="ignore").lower() if scan.exists() else ""
         candidates=[]
@@ -351,7 +349,6 @@ class EnterpriseDynamicAgent:
                 return
             attempts=state.get("action_attempts",{}).get(action_id,0); recent=state.get("history",[]); fp=self.fingerprint(command)
             repeats=sum(self.fingerprint(h.get("command",""))==fp for h in recent[-6:])
-            semantic_repeats=self.semantic_repeats(recent,command)
             if attempts>=MAX_SAME_ACTION_ATTEMPTS or repeats>=MAX_SAME_ACTION_ATTEMPTS:
                 logger.warning("[!] Acción repetida bloqueada: %s. Se fuerza replanning autónomo.",action_id)
                 state.setdefault("history",[]).append({"step":self.current_step,"command":"[BLOCKED_DUPLICATE]","output":f"Acción bloqueada: {command}"})

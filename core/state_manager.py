@@ -64,8 +64,10 @@ class StateManager:
         extra: dict | None = None,
     ):
         existing = self.load_state()
-        history = existing.get("history", [])
-        history.append(history_entry)
+        history = (extra or {}).get("history") if extra is not None else None
+        if history is None:
+            history = list(existing.get("history", []))
+            history.append(history_entry)
         data = {
             "target": self.target_ip,
             "phase": phase,

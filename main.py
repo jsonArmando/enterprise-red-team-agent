@@ -5,6 +5,7 @@ from core.reasoning import ReasoningState
 from core.action_policy import ActionPolicy
 from core.world_model import WorldModel
 from core.state_manager import StateManager
+from core.policy_engine import evaluate_policy
 from utils.smart_executor import SmartCommandExecutor
 from nodes.dynamic_agent import CommandSanitizer, LLMDecisionEngine
 
@@ -18,6 +19,8 @@ ARTIFACT_EXTENSIONS={".xml",".txt",".json",".ini",".conf",".config",".yaml",".ym
 class EnterpriseDynamicAgent:
     """Single autonomous runtime. No target-specific attack path lives here."""
     def __init__(self,target:str,domain_name:Optional[str]=None):
+        if not evaluate_policy(target):
+            raise PermissionError(f"Target '{target}' is outside the authorized scope. Aborting before any command runs.")
         self.target=target; self.domain_name=domain_name; self.state_manager=StateManager(target)
         state=self.state_manager.load_state(); self.current_step=int(state.get("step_count",0))+1
         self.executor=SmartCommandExecutor(timeout_minutes=int(os.getenv("AGENT_COMMAND_TIMEOUT_MINUTES","20")),poll_interval=int(os.getenv("AGENT_POLL_INTERVAL","15")))
@@ -253,4 +256,7 @@ class EnterpriseDynamicAgent:
 
 if __name__=="__main__":
     if len(sys.argv)<2: raise SystemExit("Usage: python main.py <target>")
-    EnterpriseDynamicAgent(sys.argv[1]).run_autonomous_loop()
+    try:
+        EnterpriseDynamicAgent(sys.argv[1]).run_autonomous_loop()
+    except PermissionError as exc:
+        raise SystemExit(f"[-] {exc}")

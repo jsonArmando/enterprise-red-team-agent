@@ -1,4 +1,4 @@
-import json, logging, os, subprocess
+import json, logging
 from pathlib import Path
 from core.security import redact_secrets
 logger=logging.getLogger("EnterpriseDynamicAgent")
@@ -6,17 +6,6 @@ class StateManager:
     def __init__(self,target_ip):
         self.target_ip=target_ip; self.state_dir=Path(f"testing/{target_ip}"); self.scans_dir=self.state_dir/"scans"; self.loot_dir=self.state_dir/"loot"
         self.state_dir.mkdir(parents=True,exist_ok=True); self.scans_dir.mkdir(exist_ok=True); self.loot_dir.mkdir(exist_ok=True); self.state_file=self.state_dir/"agent_state.json"
-    def update_etc_hosts(self,domain_name,hostnames=None):
-        if not domain_name:return
-        hostnames=hostnames or [domain_name,f"dc.{domain_name}","dc"]; line=f"{self.target_ip} {' '.join(hostnames)}"
-        try:
-            content=Path("/etc/hosts").read_text(encoding="utf-8")
-            if self.target_ip in content and domain_name in content:return
-            pwd=os.getenv("SUDO_PASS")
-            if not pwd:return
-            r=subprocess.run(["sudo","-S","tee","-a","/etc/hosts"],input=f"{pwd}\n{line}\n",capture_output=True,text=True,check=False)
-            if r.returncode:logger.error("[-] hosts update failed: %s",r.stderr)
-        except Exception as e:logger.error("[-] hosts exception: %s",e)
     def save_state(self,step,history_entry,phase="recon",mission_complete=False,discovered_services=None,vulnerabilities=None,credentials=None,extra=None):
         old=self.load_state(); history=old.get("history",[]); history.append(history_entry)
         data={**old,"target":self.target_ip,"phase":phase,"step_count":step,"mission_complete":mission_complete,"last_output":history_entry.get("output",""),"history":history,

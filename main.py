@@ -1,6 +1,6 @@
 """Single autonomous entry point for authorized HTB/lab targets."""
 from __future__ import annotations
-import sys, time, json
+import sys, json, os
 from pathlib import Path
 
 from core.state_manager import StateManager
@@ -8,6 +8,7 @@ from core.audit import AuditTrail
 from core.flags import mission_status
 from core.decision_engine import DecisionEngine
 from core.policy_engine import evaluate_policy
+from core.graph import build_persistent_redteam_graph
 from utils.exploit_matcher import ExploitMatcher
 from tools.autonomous_tools import (
     run_recon, run_vulnerability_scan, run_cve_lookup,
@@ -185,21 +186,18 @@ class EnterpriseDynamicAgent:
         state=self.load()
         self.update_flags(state)
         self.save(state)
-
-        while not state["flags"]["complete"]:
-            decision=self.engine.decide(state)
-            state,event=self.execute(state,decision)
-            self.save(state,event)
-            if state["flags"]["complete"]:
-                self.audit.record("mission_complete",flags=state["flags"])
-                break
-            time.sleep(1)
-
-        final_status="COMPLETE" if state["flags"]["complete"] else "RUNNING"
+        graph=build_persistent_redteam_graph(self)
+        final_state=graph.invoke(
+            state,
+            config={"recursion_limit": int(os.getenv("GRAPH_RECURSION_LIMIT","10000"))},
+        )
+        self.update_flags(final_state)
+        if final_state["flags"]["complete"]:
+            self.audit.record("mission_complete",flags=final_state["flags"])
         print(json.dumps({
             "target":self.target,
-            "status":final_status,
-            "flags":state["flags"],
+            "status":"COMPLETE" if final_state["flags"]["complete"] else "INCOMPLETE",
+            "flags":final_state["flags"],
             "potential_exploits":str(self.matcher.exploits_file),
             "audit":str(self.audit.events),
             "state":str(self.manager.state_file),

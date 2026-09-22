@@ -222,6 +222,7 @@ class EnterpriseDynamicAgent:
         completed=self.completed_goals(history)
         planner_state=state.get("planner_state") or {}
         blocked_goals=set(planner_state.get("blocked_goals",[]))
+        blocked_actions=set(planner_state.get("blocked_actions",[]))
         autonomy_context=self.autonomy.context(state)
         planner_context=("No hay flag todavía. Debes continuar la auditoría. NO declares mission_complete hasta detectar una flag. "
                          "No repitas objetivos de conocimiento ya completados, bloqueados o agotados. "
@@ -250,13 +251,24 @@ class EnterpriseDynamicAgent:
                 blocked_goals.add(goal)
                 augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_COMPLETED_GOAL]","output":f"Objetivo semántico {goal!r} ya completado/bloqueado."})
                 continue
+            action_id=f"llm.{self.fingerprint(cmd)}"
+            if action_id in blocked_actions:
+                augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_BLOCKED_ACTION]","output":f"Acción bloqueada: {action_id}"})
+                continue
             if normalized in blocked:
+                blocked_actions.add(action_id)
                 augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_DUPLICATE]","output":f"Comando ya ejecutado: {cmd}"})
                 continue
-            return cmd,"autonomous",f"llm.{self.fingerprint(cmd)}"
+            return cmd,"autonomous",action_id
         stalled=int(planner_state.get("stalled_attempts",0))+1
-        updated=self.persist_planner_state(state,status="STALLED",stalled_attempts=stalled,
-                                   blocked_goals=sorted(set(completed)|blocked_goals),last_reason="no_new_action")
+        updated=self.persist_planner_state(
+            state,
+            status="STALLED",
+            stalled_attempts=stalled,
+            blocked_goals=sorted(set(completed)|blocked_goals),
+            blocked_actions=sorted(blocked_actions),
+            last_reason="no_new_action"
+        )
         logger.warning("[!] Planner agotó sus %d reintentos sin una acción nueva.",MAX_PLANNER_RETRIES)
         return self.recovery_action(updated)
 
@@ -321,7 +333,17 @@ class EnterpriseDynamicAgent:
             if result.get("stderr"):output+="\nSTDERR:\n"+result["stderr"]
             entry={"step":self.current_step,"action_id":action_id,"command":command,"output":output[:8000],"status":result.get("status"),"returncode":result.get("returncode")}
             autonomy_update=self.autonomy.observe(state, entry)
-            self.state_manager.save_state(self.current_step,entry,phase,False,extra={"last_action_id":action_id,"last_command_fingerprint":fp,"action_attempts":{**state.get("action_attempts",{}),action_id:attempts+1},"potential_exploit":getattr(self,"current_potential_exploit",{"available":False,"candidate_count":0,"candidates":[]}),"autonomy":autonomy_update,"planner_state":{"status":"PROGRESS","stalled_attempts":0,"blocked_goals":list((state.get("planner_state") or {}).get("blocked_goals",[])),"last_reason":"action_executed"}})
+            previous_planner_state=dict(state.get("planner_state") or {})
+            next_planner_state={
+                **previous_planner_state,
+                "status":"PROGRESS",
+                "stalled_attempts":0,
+                "blocked_goals":list(previous_planner_state.get("blocked_goals",[])),
+                "blocked_actions":list(previous_planner_state.get("blocked_actions",[])),
+                "recovery_attempts":list(previous_planner_state.get("recovery_attempts",[])),
+                "last_reason":"action_executed",
+            }
+            self.state_manager.save_state(self.current_step,entry,phase,False,extra={"last_action_id":action_id,"last_command_fingerprint":fp,"action_attempts":{**state.get("action_attempts",{}),action_id:attempts+1},"potential_exploit":getattr(self,"current_potential_exploit",{"available":False,"candidate_count":0,"candidates":[]}),"autonomy":autonomy_update,"planner_state":next_planner_state})
             self.current_step+=1; time.sleep(1)
         logger.warning("[!] Límite de seguridad de %d pasos alcanzado sin flag; la misión NO se marca como completada.",MAX_STEPS)
 

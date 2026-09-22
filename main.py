@@ -365,8 +365,10 @@ class EnterpriseDynamicAgent:
             # anterior no produjo evidencia nueva.
             action_intent=ReasoningState.action_intent(command)
             semantic_repeat=any(
-                h.get("action_intent")==action_intent and h.get("no_new_evidence") is True
-                for h in recent
+                h.get("action_intent")==action_intent
+                and h.get("no_new_evidence") is True
+                and int(h.get("step", -999)) >= self.current_step - 3
+                for h in recent[-6:]
             )
             if semantic_repeat:
                 logger.warning("[!] Acción semánticamente repetida sin evidencia nueva: %s",action_intent)

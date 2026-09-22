@@ -59,7 +59,12 @@ class ReasoningState:
 
     @classmethod
     def derive_capabilities(cls, facts: List[str], history: List[Dict[str, Any]]) -> List[str]:
-        text = " ".join(facts + [str(h.get("output", "")) for h in history[-8:]]).lower()
+        recent = history[-12:]
+        text = " ".join(
+            facts
+            + [str(h.get("output", "")) for h in recent]
+            + [str(h.get("command", "")) for h in recent]
+        ).lower()
         capabilities = []
         if re.search(r"\b(?:open|accessible|listing).{0,80}\b(?:smb|cifs|share)\b|\b(?:smb|cifs).{0,80}\b(?:accessible|anonymous|read)\b", text):
             capabilities.append("smb_access")

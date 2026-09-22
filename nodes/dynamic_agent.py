@@ -35,9 +35,9 @@ class LLMDecisionEngine:
             if isinstance(content,list):
                 content="".join(str(x.get("text","") if isinstance(x,dict) else x) for x in content)
             content=str(content).strip()
-            content=re.sub(r"^```(?:json)?\\s*|\\s*```$","",content,flags=re.I|re.S).strip()
+            content=re.sub(r"^```(?:json)?\s*|\s*```$","",content,flags=re.I|re.S).strip()
             if not content.startswith("{"):
-                match=re.search(r"\\{.*\\}",content,re.S)
+                match=re.search(r"\{.*\}",content,re.S)
                 content=match.group(0) if match else content
             data=json.loads(content)
             return data if isinstance(data,dict) else {}

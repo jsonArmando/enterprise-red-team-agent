@@ -6,6 +6,7 @@ from utils.smart_executor import SmartCommandExecutor
 from utils.exploit_matcher import ExploitMatcher
 from nodes.dynamic_agent import LLMDecisionEngine, CommandSanitizer
 from core.autonomy import AutonomyEngine
+from core.security import redact_secrets
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", handlers=[logging.StreamHandler(sys.stdout)])
 logger=logging.getLogger("EnterpriseDynamicAgent")
@@ -14,6 +15,7 @@ MAX_STEPS=200
 MAX_SAME_ACTION_ATTEMPTS=3
 MAX_PLANNER_RETRIES=2
 MAX_PLANNER_STALLS=3
+MAX_NO_PROGRESS_STREAK=5
 CANONICAL_SCAN="version_scan.txt"
 LEGACY_SCANS=("full_recon.txt",)
 
@@ -147,6 +149,8 @@ class EnterpriseDynamicAgent:
             return "credential_dump_analysis"
         if "ldapsearch" in text:
             return "ldap_query"
+        if "rpcclient" in text:
+            return "rpc_enumeration"
         return re.sub(r"\s+"," ",text)[:160]
 
     @staticmethod
@@ -155,7 +159,8 @@ class EnterpriseDynamicAgent:
         family=EnterpriseDynamicAgent.action_family(command)
         if family in {"enumerate_domain_users","enumerate_domain_groups","enumerate_smb_shares",
                       "retrieve_replication_artifacts","analyze_gpp_artifacts","kerberos_spn_enumeration",
-                      "asrep_enumeration","ad_graph_collection","credential_dump_analysis","remote_session_access"}:
+                      "asrep_enumeration","ad_graph_collection","credential_dump_analysis","remote_session_access",
+                      "rpc_enumeration","ldap_query"}:
             return family
         if family=="ntp_time_synchronization":
             return family
@@ -328,22 +333,33 @@ class EnterpriseDynamicAgent:
                 logger.warning("[!] Acción repetida bloqueada: %s. Se fuerza replanning autónomo.",action_id)
                 state.setdefault("history",[]).append({"step":self.current_step,"command":"[BLOCKED_DUPLICATE]","output":f"Acción bloqueada: {command}"})
                 self.state_manager.save_state(self.current_step,state["history"][-1],"autonomous",False); self.current_step+=1; continue
-            logger.info("[*] Paso %d/%d | %s | %s",self.current_step,MAX_STEPS,action_id,command)
+            logger.info("[*] Paso %d/%d | %s | %s",self.current_step,MAX_STEPS,action_id,redact_secrets(command))
             result=self.executor.execute_with_polling(command); output=result.get("stdout","")
             if result.get("stderr"):output+="\nSTDERR:\n"+result["stderr"]
-            entry={"step":self.current_step,"action_id":action_id,"command":command,"output":output[:8000],"status":result.get("status"),"returncode":result.get("returncode")}
-            autonomy_update=self.autonomy.observe(state, entry)
+            raw_entry={"step":self.current_step,"action_id":action_id,"command":command,"output":output[:8000],"status":result.get("status"),"returncode":result.get("returncode")}
+            autonomy_update=self.autonomy.observe(state, raw_entry)
+            persisted_entry=redact_secrets(raw_entry)
             previous_planner_state=dict(state.get("planner_state") or {})
+            progress_streak=int(autonomy_update.get("no_progress_streak",0))
+            if autonomy_update.get("last_progress"):
+                planner_status="PROGRESS"; planner_stalls=0; reason="new_evidence"
+            else:
+                planner_status="NO_PROGRESS"; planner_stalls=int(previous_planner_state.get("stalled_attempts",0))+1; reason="no_new_evidence"
             next_planner_state={
                 **previous_planner_state,
-                "status":"PROGRESS",
-                "stalled_attempts":0,
+                "status":planner_status,
+                "stalled_attempts":planner_stalls,
+                "no_progress_streak":progress_streak,
                 "blocked_goals":list(previous_planner_state.get("blocked_goals",[])),
                 "blocked_actions":list(previous_planner_state.get("blocked_actions",[])),
                 "recovery_attempts":list(previous_planner_state.get("recovery_attempts",[])),
-                "last_reason":"action_executed",
+                "last_reason":reason,
             }
-            self.state_manager.save_state(self.current_step,entry,phase,False,extra={"last_action_id":action_id,"last_command_fingerprint":fp,"action_attempts":{**state.get("action_attempts",{}),action_id:attempts+1},"potential_exploit":getattr(self,"current_potential_exploit",{"available":False,"candidate_count":0,"candidates":[]}),"autonomy":autonomy_update,"planner_state":next_planner_state})
+            self.state_manager.save_state(self.current_step,persisted_entry,phase,False,extra={"last_action_id":action_id,"last_command_fingerprint":fp,"action_attempts":{**state.get("action_attempts",{}),action_id:attempts+1},"potential_exploit":getattr(self,"current_potential_exploit",{"available":False,"candidate_count":0,"candidates":[]}),"autonomy":autonomy_update,"planner_state":next_planner_state})
+            if progress_streak >= MAX_NO_PROGRESS_STREAK:
+                logger.error("[!] Presupuesto de progreso agotado (%d pasos sin evidencia nueva); deteniendo misión para evitar ciclo táctico.",progress_streak)
+                self.persist_planner_state({**state,"autonomy":autonomy_update},status="EXHAUSTED",stalled_attempts=planner_stalls,no_progress_streak=progress_streak,last_reason="progress_budget_exhausted")
+                return
             self.current_step+=1; time.sleep(1)
         logger.warning("[!] Límite de seguridad de %d pasos alcanzado sin flag; la misión NO se marca como completada.",MAX_STEPS)
 

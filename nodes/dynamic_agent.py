@@ -174,7 +174,7 @@ class LLMDecisionEngine:
             "{\n"
             '  "thought": "Análisis táctico detallado justificando el siguiente paso técnico",\n'
             '  "command": "Comando exacto de Kali Linux a ejecutar sin comentarios",\n'
-            '  "mission_complete": false\n'
+            '  "mission_complete": False\n'
             "}"
             "Regla crítica: los candidatos de potential_exploit requieren validación contra la evidencia; no los trates como comandos por sí mismos.\n"
             "Regla crítica: mission_complete SOLO puede ser true cuando exista evidencia de una FLAG real en la salida o en testing/<target>/loot. Si no hay flag, debes proponer otra acción; no declares la auditoría completada por falta de vectores inmediatos.\n"

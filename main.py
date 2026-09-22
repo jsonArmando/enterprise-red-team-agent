@@ -332,6 +332,8 @@ class EnterpriseDynamicAgent:
         # Las nuevas credenciales/capacidades ya no disparan una receta fija.
         # Se entregan al modelo del mundo y al razonador para que determine qué
         # hipótesis merece ser investigada a continuación.
+        # Recargar el modelo del mundo persistido: cada ciclo razona sobre el estado actual.
+        self.reasoning=ReasoningState(state)
         planner_state={**state,"potential_exploit":potential}
         fallback=self.autonomous_fallback(planner_state,potential_exploit=potential)
         if fallback:return fallback

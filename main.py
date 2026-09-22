@@ -180,7 +180,7 @@ class EnterpriseDynamicAgent:
 
     def autonomous_fallback(self,state,potential_exploit=None):
         history=state.get("history",[]); blocked=[]
-        for h in history[-12:]:
+        for h in history[-20:]:
             cmd=h.get("command","")
             if cmd: blocked.append(re.sub(r"\s+"," ",cmd.strip()))
         planner=LLMDecisionEngine(); augmented_history=list(history)
@@ -188,7 +188,7 @@ class EnterpriseDynamicAgent:
         autonomy_context=self.autonomy.context(state)
         planner_context=("No hay flag todavía. Debes continuar la auditoría. NO declares mission_complete hasta detectar una flag. "
                          "No repitas objetivos de conocimiento ya completados con éxito; cambia de objetivo salvo que exista evidencia nueva de fallo o necesidad. "
-                         f"Objetivos ya completados: {json.dumps(sorted(completed))}. "
+                         f"Objetivos ya completados/bloqueados: {json.dumps(sorted(completed))}. No repitas ninguno; cambia de objetivo y técnica. "
                          "El LLM conserva libertad táctica para elegir el siguiente objetivo y herramienta; el supervisor solo impide repeticiones estériles, corrupción del estado y finalización sin evidencia. "
                          f"Estado de autonomía: {json.dumps(autonomy_context, ensure_ascii=False)}. "
                          "Comandos ya ejecutados y que NO debes repetir exactamente: "+json.dumps(blocked)+"\\n")
@@ -200,6 +200,10 @@ class EnterpriseDynamicAgent:
             cmd=CommandSanitizer.clean(decision.get("command",""))
             if not cmd: continue
             normalized=re.sub(r"\s+"," ",cmd.strip())
+            goal=self.action_goal(cmd)
+            if goal and goal in completed:
+                augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_COMPLETED_GOAL]","output":f"Objetivo semántico {goal!r} ya completado; selecciona otro objetivo."})
+                continue
             if normalized not in blocked:return cmd,"autonomous",f"llm.{self.fingerprint(cmd)}"
             augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_DUPLICATE]","output":f"El comando {cmd!r} ya fue ejecutado. Selecciona una técnica diferente."})
         return None

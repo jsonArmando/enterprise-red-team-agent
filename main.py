@@ -127,6 +127,33 @@ class EnterpriseDynamicAgent:
         p.parent.mkdir(parents=True,exist_ok=True)
         return {"action_class":"discover_services","goal_id":"discover_services","hypothesis_id":"","evidence_question":"What services, protocols and exposed surfaces are present on the target?","resource":self.target,"command":f"nmap -sV -sC -oN {shlex.quote(str(p))} {shlex.quote(self.target)}","mission_complete":False}
 
+    def _candidate_grounded(self,d,context):
+        world=context.get("world",{})
+        serialized=json.dumps(world,ensure_ascii=False).lower()
+        basis=self._norm(d.get("evidence_basis"))
+        if not basis:
+            return False,"missing_evidence_basis"
+        tokens=[t for t in re.findall(r"[a-z0-9_./=-]{5,}",basis.lower()) if t not in {"observed","evidence","resource","facts","capability"}]
+        if tokens and not any(t in serialized for t in tokens):
+            return False,"evidence_basis_not_grounded"
+        intent=ReasoningState.action_intent(d.get("command",""))
+        caps={str(x).lower() for x in world.get("capabilities",[])}
+        if intent.startswith("enumerate_ldap:") and "ldap_visibility" not in caps:
+            return False,"ldap_surface_not_observed"
+        if intent.startswith("inspect_smb_resource:") or intent.startswith("retrieve_remote_artifact:"):
+            if "smb_surface" not in caps and "smb_access" not in caps:
+                return False,"smb_surface_not_observed"
+        hid=str(d.get("hypothesis_id") or "")
+        hypotheses={str(h.get("id")):h for h in world.get("hypotheses",[]) if h.get("id")}
+        if hid not in hypotheses:
+            return False,"hypothesis_not_observed"
+        if d.get("goal_id"):
+            goals={str(g.get("id")):g for g in world.get("candidate_goals",[]) if g.get("id")}
+            g=goals.get(str(d.get("goal_id")))
+            if g and str(g.get("source_hypothesis") or "") not in ("",hid):
+                return False,"goal_hypothesis_mismatch"
+        return True,"grounded"
+
     def _plan(self,state):
         context=self._context(state)
         for _ in range(MAX_PLANNER_RETRIES):
@@ -161,6 +188,9 @@ class EnterpriseDynamicAgent:
                     self._block(state,"candidate_unknown_hypothesis",d); continue
                 if valid_g and gid and gid not in valid_g:
                     self._block(state,"candidate_unknown_goal",d); continue
+                grounded,ground_reason=self._candidate_grounded(d,context)
+                if not grounded:
+                    self._block(state,ground_reason,d); continue
                 intent=ReasoningState.action_intent(d["command"])
                 if intent in seen_intents:
                     self._block(state,"candidate_semantic_duplicate",d); continue

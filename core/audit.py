@@ -10,6 +10,9 @@ class AuditTrail:
         self.dir = workdir / "audit"
         self.dir.mkdir(parents=True, exist_ok=True)
         self.events = self.dir / "events.jsonl"
+        legacy = self.dir / "event.jsonl"
+        if legacy.exists() and not self.events.exists():
+            legacy.replace(self.events)
 
     def record(self, event_type: str, **data: Any) -> None:
         event = {

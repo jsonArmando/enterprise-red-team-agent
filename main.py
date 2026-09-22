@@ -130,6 +130,10 @@ class EnterpriseDynamicAgent:
             if rel in inspected or str(p) in inspected:
                 continue
             # Prefer artifacts explicitly reported by a successful retrieval.
+            # Some tools (notably smbclient) may retrieve a file successfully
+            # without echoing the filename in stdout. In that case filesystem
+            # evidence is authoritative: an uninspected artifact in loot is
+            # still eligible, while generated metadata remains excluded.
             if retrieved and not any(rel.endswith(x) or str(p).endswith(x) for x in retrieved):
                 continue
             try:
@@ -138,6 +142,22 @@ class EnterpriseDynamicAgent:
             except OSError:
                 continue
             candidates.append(rel)
+        if not candidates and retrieved:
+            # Retrieval succeeded but stdout did not expose a parseable filename.
+            # Re-scan the loot directory without requiring output-name matching.
+            for p in sorted(loot.rglob("*")):
+                if (not p.is_file() or p.name.lower() in generated
+                        or p.suffix.lower() not in {".xml",".txt",".json",".ini",".conf",".config"}):
+                    continue
+                rel=os.path.normpath(os.path.relpath(p, Path.cwd()))
+                if rel in inspected or str(p) in inspected:
+                    continue
+                try:
+                    if p.stat().st_size > 2_000_000:
+                        continue
+                except OSError:
+                    continue
+                candidates.append(rel)
         if not candidates:
             return None
         artifact=candidates[0]

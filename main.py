@@ -4,12 +4,13 @@ from Crypto.Cipher import AES
 from core.state_manager import StateManager
 from utils.smart_executor import SmartCommandExecutor
 from utils.exploit_matcher import ExploitMatcher
+from nodes.dynamic_agent import LLMDecisionEngine, CommandSanitizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", handlers=[logging.StreamHandler(sys.stdout)])
 logger=logging.getLogger("EnterpriseDynamicAgent")
 
-MAX_STEPS=30
-MAX_SAME_ACTION_ATTEMPTS=2
+MAX_STEPS=200
+MAX_SAME_ACTION_ATTEMPTS=3
 CANONICAL_SCAN="version_scan.txt"
 LEGACY_SCANS=("full_recon.txt",)
 
@@ -63,6 +64,46 @@ class EnterpriseDynamicAgent:
                 return q
         return p
 
+    def flags_found(self):
+        """Detecta flags reales antes de declarar la misión terminada."""
+        root=Path(f"testing/{self.target_ip}")
+        if not root.exists(): return []
+        found=[]
+        filename_patterns=("user.txt","root.txt","local.txt","proof.txt","flag.txt","flags.json","user.flag","root.flag")
+        flag_re=re.compile(r"(?:flag|htb)\\{[^}]{4,200}\\}",re.I)
+        for p in root.rglob("*"):
+            if not p.is_file(): continue
+            if p.name.lower() in filename_patterns:
+                found.append(str(p))
+                continue
+            try:
+                if p.stat().st_size>2_000_000: continue
+                data=p.read_text(encoding="utf-8",errors="ignore")
+                if flag_re.search(data): found.append(str(p))
+            except (OSError,UnicodeError):
+                continue
+        return sorted(set(found))
+
+    def autonomous_fallback(self,state):
+        """Pide al LLM una acción nueva cuando el plan determinista se agota."""
+        history=state.get("history",[])
+        blocked=[]
+        for h in history[-12:]:
+            cmd=h.get("command","")
+            if cmd: blocked.append(re.sub(r"\\s+"," ",cmd.strip()))
+        planner=LLMDecisionEngine()
+        augmented_history=list(history)
+        augmented_history.append({"step":state.get("step_count",0),"command":"[PLANNER]","output":"No hay flag todavía. Debes continuar la auditoría. NO declares mission_complete hasta detectar una flag. Comandos ya ejecutados y que NO debes repetir exactamente: " + json.dumps(blocked)})
+        for _ in range(3):
+            decision=planner.consult_tactical_next_step(self.target_ip,augmented_history,state.get("last_output", ""))
+            cmd=CommandSanitizer.clean(decision.get("command", ""))
+            if not cmd: continue
+            normalized=re.sub(r"\\s+"," ",cmd.strip())
+            if normalized not in blocked:
+                return cmd,"autonomous",f"llm.{self.fingerprint(cmd)}"
+            augmented_history.append({"step":state.get("step_count",0),"command":"[REJECTED_DUPLICATE]","output":f"El comando {cmd!r} ya fue ejecutado. Selecciona una técnica diferente."})
+        return None
+
     def determine_next_action(self,state):
         history=state.get("history",[]); commands=[h.get("command","") for h in history]
         for raw_path in (Path(f"testing/{self.target_ip}/potential_exploits.json"),Path("potential_exploits.json")):
@@ -85,29 +126,42 @@ class EnterpriseDynamicAgent:
         creds=self.parse_loot_for_credentials()
         if creds["username"] and creds["password"] and not any("secretsdump" in c for c in commands):
             return f"impacket-secretsdump {domain}/{creds['username']}:{creds['password']}@{self.target_ip}","post-exploitation","post.secretsdump"
-        return "echo '[*] Auditoría completada. No se encontraron más vectores de ataque.'","complete","complete"
+        fallback=self.autonomous_fallback(state)
+        if fallback:
+            return fallback
+        return "","autonomous","planner.stalled"
 
     def run_autonomous_loop(self):
         while self.current_step<=MAX_STEPS:
             state=self.state_manager.load_state()
             if state.get("mission_complete"):return
+            flags=self.flags_found()
+            if flags:
+                self.state_manager.mark_complete("flag_found:"+flags[0],self.current_step)
+                logger.info("[+] FLAG DETECTADA: %s",flags[0]); return
             command,phase,action_id=self.determine_next_action(state)
+            if not command:
+                logger.warning("[!] Planner sin acción nueva; se reintentará con contexto actualizado.")
+                time.sleep(2); continue
             attempts=state.get("action_attempts",{}).get(action_id,0)
             recent=state.get("history",[])
             fp=self.fingerprint(command)
             repeats=sum(self.fingerprint(h.get("command",""))==fp for h in recent[-6:])
-            if action_id in set(state.get("completed_actions",[])) or attempts>=MAX_SAME_ACTION_ATTEMPTS or repeats>=MAX_SAME_ACTION_ATTEMPTS:
-                self.state_manager.mark_complete(f"loop_or_duplicate:{action_id}",self.current_step)
-                logger.warning("[!] Loop/duplicado detenido: %s",action_id); return
+            if attempts>=MAX_SAME_ACTION_ATTEMPTS or repeats>=MAX_SAME_ACTION_ATTEMPTS:
+                logger.warning("[!] Acción repetida bloqueada: %s. Se fuerza replanning autónomo.",action_id)
+                state.setdefault("history",[]).append({"step":self.current_step,"command":"[BLOCKED_DUPLICATE]","output":f"Acción bloqueada: {command}"})
+                self.state_manager.save_state(self.current_step,state["history"][-1],"autonomous",False)
+                self.current_step+=1
+                continue
             if phase=="complete":
-                self.state_manager.mark_complete("planner_complete",self.current_step); return
+                logger.info("[*] El plan determinista terminó sin flag; pasando al planner autónomo.")
+                phase="autonomous"
             logger.info("[*] Paso %d/%d | %s | %s",self.current_step,MAX_STEPS,action_id,command)
             result=self.executor.execute_with_polling(command); output=result.get("stdout","")
             if result.get("stderr"):output+="\nSTDERR:\n"+result["stderr"]
             self.state_manager.save_state(self.current_step,{"step":self.current_step,"action_id":action_id,"command":command,"output":output[:8000],"status":result.get("status"),"returncode":result.get("returncode")},phase,False,extra={"last_action_id":action_id,"last_command_fingerprint":fp,"action_attempts":{**state.get("action_attempts",{}),action_id:attempts+1}})
             self.current_step+=1; time.sleep(1)
-        self.state_manager.mark_complete("max_steps",self.current_step)
-        logger.warning("[!] Límite global de %d pasos alcanzado.",MAX_STEPS)
+        logger.warning("[!] Límite de seguridad de %d pasos alcanzado sin flag; la misión NO se marca como completada.",MAX_STEPS)
 
 if __name__=="__main__":
     EnterpriseDynamicAgent(sys.argv[1] if len(sys.argv)>1 else "10.129.9.175").run_autonomous_loop()

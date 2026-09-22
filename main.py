@@ -367,6 +367,7 @@ class EnterpriseDynamicAgent:
             semantic_repeat=any(
                 h.get("action_intent")==action_intent
                 and h.get("no_new_evidence") is True
+                and h.get("returncode") == 0
                 and int(h.get("step", -999)) >= self.current_step - 3
                 for h in recent[-6:]
             )

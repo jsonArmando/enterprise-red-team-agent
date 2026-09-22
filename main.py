@@ -118,11 +118,13 @@ class EnterpriseDynamicAgent:
     @staticmethod
     def action_family(command):
         text=re.sub(r"\\s+"," ",command.lower().strip())
-        if any(x in text for x in ("--users","enumdomusers","enumerate users")):
+        if any(x in text for x in ("ntpdate","timedatectl","chronyc")):
+            return "ntp_time_synchronization"
+        if any(x in text for x in ("--users","enumdomusers","enumerate users","objectclass=user")):
             return "enumerate_domain_users"
-        if any(x in text for x in ("--groups","enumdomgroups","enumerate groups")):
+        if any(x in text for x in ("--groups","enumdomgroups","enumerate groups","objectclass=group")):
             return "enumerate_domain_groups"
-        if any(x in text for x in ("--shares","smbclient -l","smbmap","smbclient -l")):
+        if any(x in text for x in ("--shares","smbclient -l","smbmap")):
             return "enumerate_smb_shares"
         if "replication" in text and ("smbclient" in text or "mget" in text):
             return "retrieve_replication_artifacts"
@@ -136,7 +138,37 @@ class EnterpriseDynamicAgent:
             return "ad_graph_collection"
         if "secretsdump" in text:
             return "credential_dump_analysis"
+        if "ldapsearch" in text:
+            return "ldap_query"
         return re.sub(r"\\s+"," ",text)[:160]
+
+    @staticmethod
+    def action_goal(command):
+        """Clasifica el objetivo de conocimiento, independientemente de la herramienta usada."""
+        family=EnterpriseDynamicAgent.action_family(command)
+        if family in {"enumerate_domain_users","enumerate_domain_groups","enumerate_smb_shares",
+                      "retrieve_replication_artifacts","analyze_gpp_artifacts","kerberos_spn_enumeration",
+                      "asrep_enumeration","ad_graph_collection","credential_dump_analysis"}:
+            return family
+        if family=="ntp_time_synchronization":
+            return family
+        return None
+
+    @staticmethod
+    def _successful_entry(entry):
+        rc=entry.get("returncode")
+        status=str(entry.get("status","")).lower()
+        output=str(entry.get("output","")).strip()
+        return (rc == 0 or status in {"success","completed","ok"}) and bool(output)
+
+    def completed_goals(self,history):
+        goals=set()
+        for entry in history:
+            cmd=entry.get("command","")
+            goal=self.action_goal(cmd) if cmd else None
+            if goal and self._successful_entry(entry):
+                goals.add(goal)
+        return goals
 
     def semantic_repeats(self,history,command):
         family=self.action_family(command)
@@ -148,7 +180,11 @@ class EnterpriseDynamicAgent:
             cmd=h.get("command","")
             if cmd: blocked.append(re.sub(r"\s+"," ",cmd.strip()))
         planner=LLMDecisionEngine(); augmented_history=list(history)
-        planner_context=("No hay flag todavía. Debes continuar la auditoría. NO declares mission_complete hasta detectar una flag. Comandos ya ejecutados y que NO debes repetir exactamente: "+json.dumps(blocked)+"\\n")
+        completed=self.completed_goals(history)
+        planner_context=("No hay flag todavía. Debes continuar la auditoría. NO declares mission_complete hasta detectar una flag. "
+                         "No repitas objetivos de conocimiento ya completados con éxito; cambia de objetivo salvo que exista evidencia nueva de fallo o necesidad. "
+                         f"Objetivos ya completados: {json.dumps(sorted(completed))}. "
+                         "Comandos ya ejecutados y que NO debes repetir exactamente: "+json.dumps(blocked)+"\\n")
         if potential_exploit and potential_exploit.get("available"):
             planner_context += ("Existe potential_exploit como metadata de candidatos. Debes validar aplicabilidad contra la evidencia antes de proponer cualquier acción; NO trates campos de SearchSploit como comandos ejecutables. Candidatos: "+json.dumps(potential_exploit,ensure_ascii=False)[:6000])
         augmented_history.append({"step":state.get("step_count",0),"command":"[PLANNER]","output":planner_context})
@@ -195,6 +231,16 @@ class EnterpriseDynamicAgent:
             attempts=state.get("action_attempts",{}).get(action_id,0); recent=state.get("history",[]); fp=self.fingerprint(command)
             repeats=sum(self.fingerprint(h.get("command",""))==fp for h in recent[-6:])
             semantic_repeats=self.semantic_repeats(recent,command)
+            goal=self.action_goal(command)
+            completed_goals=self.completed_goals(recent)
+            if goal=="ntp_time_synchronization" and goal in completed_goals:
+                logger.warning("[!] Objetivo NTP ya completado; se bloquea nueva sincronización sin evidencia nueva.")
+                state.setdefault("history",[]).append({"step":self.current_step,"command":"[BLOCKED_NO_PROGRESS]","output":f"Objetivo ya completado: {goal}"})
+                self.state_manager.save_state(self.current_step,state["history"][-1],"autonomous",False); self.current_step+=1; continue
+            if goal and goal in completed_goals:
+                logger.warning("[!] Objetivo semántico ya completado: %s. Se fuerza replanning.",goal)
+                state.setdefault("history",[]).append({"step":self.current_step,"command":"[BLOCKED_NO_PROGRESS]","output":f"Objetivo ya completado: {goal}"})
+                self.state_manager.save_state(self.current_step,state["history"][-1],"autonomous",False); self.current_step+=1; continue
             if attempts>=MAX_SAME_ACTION_ATTEMPTS or repeats>=MAX_SAME_ACTION_ATTEMPTS or semantic_repeats>=MAX_SAME_ACTION_ATTEMPTS:
                 logger.warning("[!] Acción repetida bloqueada: %s. Se fuerza replanning autónomo.",action_id)
                 state.setdefault("history",[]).append({"step":self.current_step,"command":"[BLOCKED_DUPLICATE]","output":f"Acción bloqueada: {command}"})

@@ -1,53 +1,41 @@
 # Enterprise Dynamic Red Team Agent
 
-Authorized-lab agent for **Hack The Box / classroom ranges only**.
-
-It runs a policy-gated playbook: recon → enum → optional assume-breach → loot `user.txt` / `root.txt`.
-
-## Scope (hard gate)
-
-Commands run only if the target IP is in:
-
-- `10.10.0.0/16`
-- `10.129.0.0/16`
-- `10.13.0.0/16`
-
-or a domain ending in `.htb` / `.lab` / `.local`.
-
-Override with `ALLOWED_NETWORKS=cidr,cidr` for *your* lab. Do not point this at the public Internet.
-
-## Run (Kali)
+Agente **automático** para laboratorios autorizados (HTB).
 
 ```bash
-python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env   # optional SUDO_PASS for /etc/hosts
-
 python3 main.py 10.129.x.x
-python3 main.py 10.129.x.x --user rose --password 'labpass'
-python3 main.py 10.129.x.x --dry-run
 ```
 
-State and loot: `testing/<ip>/agent_state.json` and `testing/<ip>/loot/`.
+No pases usuario ni contraseña. El agente:
 
-## Layout
+1. Escanea (nmap)
+2. Enumera (nxc / kerbrute / gobuster)
+3. Extrae usuarios y passwords de salidas y archivos
+4. Hace spray y reutiliza credenciales válidas
+5. Intenta leer flags por WinRM/SSH
+6. Persiste todo en disco
+
+## Dónde se guarda
 
 ```text
-main.py                 # policy + playbook loop
-core/policy_engine.py   # allowlist
-core/playbook.py        # nmap, nxc, kerbrute, gobuster, winrm/ssh loot
-core/flags.py           # 32-hex HTB flags
-core/state_manager.py
-utils/smart_executor.py
-nodes/                  # experimental LangGraph path (optional)
-kali-redteam-agent/     # older compact copy
+testing/<ip>/
+  agent.log
+  agent_state.json
+  logs/step_01.log ...
+  scans/
+  loot/
+    users.txt
+    passwords.txt
+    credentials.json
+    user.flag
+    root.flag
+    flags.json
 ```
 
-## What it will not do
+## Alcance
 
-- Skip the policy engine
-- Commit VPN profiles (`.ovpn` gitignored)
-- Treat the string `user.txt` as a flag (needs a 32-hex value)
-- Use a hardcoded sudo password
+Solo IPs `10.10.0.0/16`, `10.129.0.0/16`, `10.13.0.0/16` o dominios `*.htb`.
 
-Flags still require valid lab credentials or a working foothold. Pass `--user/--password` when the box is assume-breach (HTB Easy AD).
+## Límite
+
+Si el lab exige una credencial que **no aparece** en shares/nmap/AS-REP, el spray no la inventa. En HTB Easy AD a veces la ficha da un user inicial: déjala en `testing/<ip>/loot/credentials.json` y relanza el mismo comando (sin flags).

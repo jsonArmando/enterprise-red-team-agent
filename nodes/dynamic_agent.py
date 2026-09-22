@@ -51,6 +51,7 @@ class LLMDecisionEngine:
             "Do not produce cosmetic variants of the same semantic investigation. If recent evidence is sterile, switch hypothesis or surface. "
             "Execution is strictly non-interactive: stdin is closed, so every command must pass explicit authentication (e.g. -N/--no-pass for anonymous, or user:pass@host) and never rely on a password prompt. "
             "The working directory is the workspace.loot_dir from the context; write tool outputs/downloads with RELATIVE filenames (or -oN/-outputfile <name>) so they are persisted and auto-inspected. Multi-step chains (e.g. request a hash, then crack it) should save intermediate artifacts to such files. "
+            "For SMB retrieval, do not guess remote paths: mirror the share with smbclient -c 'recurse ON; prompt OFF; mget *' (or use an exact smb_file: path from the world model). Downloaded files are inspected automatically. "
             "mission_complete is true only with explicit flag evidence. Vulnerability metadata is advisory only. Never invent output, credentials, or evidence. "
             "Return ONLY JSON: {\\\"candidates\\\":[{...}],\\\"mission_complete\\\":false}. rationale must be one short sentence; never provide hidden chain-of-thought.")
         payload={"model":self.model_name,"messages":[{"role":"system","content":prompt},{"role":"user","content":f"Target: {target}\\nWorld model:\\n{json.dumps(context,ensure_ascii=False,indent=2)}"}],"temperature":float(os.getenv("AGENT_LLM_TEMPERATURE","0.35"))}

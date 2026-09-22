@@ -144,6 +144,38 @@ class ReasoningState:
             return "enumerate_remote_surface"
         return text[:180]
 
+    # smbclient recursive listing: a directory header line begins with a
+    # backslash-rooted path; file entries follow, indented, with attribute
+    # flags + size + date. Reconstructing full paths from this output is what
+    # lets the planner issue an exact `get <path>` instead of guessing.
+    _SMB_DIR_HEADER = re.compile(r"^\\[^\r\n]*$")
+    _SMB_ENTRY = re.compile(r"^\s+(.+?)\s{2,}([DAHSRNI]+)\s+(\d+)\s+\w{3}\s+\w{3}\s+\d")
+
+    @classmethod
+    def parse_smb_listing(cls, output: str) -> List[str]:
+        """Reconstruct full \\dir\\file paths from smbclient recursive listings.
+
+        Directories are skipped; only file entries are returned. Content-based
+        (not command-based) so it also works when the listing was saved to a
+        file and later inspected.
+        """
+        paths: List[str] = []
+        current = None
+        for raw in str(output or "").splitlines():
+            line = raw.rstrip("\r\n")
+            if not line.strip():
+                continue
+            if cls._SMB_DIR_HEADER.match(line) and "\\" in line[1:]:
+                current = line.strip().rstrip("\\")
+                continue
+            m = cls._SMB_ENTRY.match(line)
+            if m and current is not None:
+                name, flags = m.group(1).strip(), m.group(2)
+                if name in (".", "..") or "D" in flags:
+                    continue
+                paths.append(f"{current}\\{name}")
+        return cls._unique(paths, 64)
+
     @staticmethod
     def extract_entities(output: str) -> Dict[str, List[str]]:
         """Extract stable resource/identity names without target-specific assumptions."""
@@ -159,6 +191,9 @@ class ReasoningState:
         for kind, pats in patterns.items():
             for pat in pats:
                 entities[kind].extend(re.findall(pat, text))
+        # Full SMB paths (with directory context) are the most actionable
+        # artifacts: they tell the planner exactly what to `get`.
+        entities["artifacts"].extend(ReasoningState.parse_smb_listing(text))
         return {k: ReasoningState._unique(v, 64) for k, v in entities.items()}
 
     @classmethod
@@ -480,6 +515,10 @@ class ReasoningState:
     def update(self, output: str, history: List[Dict[str, Any]], command: str = "") -> Dict[str, Any]:
         old_facts = list(self.old.get("facts", []))
         new_facts = self.extract_facts(output, command)
+        # Surface reconstructed SMB file paths as first-class facts so the
+        # planner can target an exact `get` and grounding recognizes them.
+        smb_paths = [f"smb_file: {p}" for p in self.parse_smb_listing(output)]
+        new_facts = self._unique(new_facts + smb_paths, 128)
         facts = self._unique(old_facts + new_facts, 256)
         capabilities = self.derive_capabilities(facts, history)
         hypotheses = self.generate_hypotheses(facts, capabilities, history)

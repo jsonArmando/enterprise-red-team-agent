@@ -249,11 +249,11 @@ class EnterpriseDynamicAgent:
         hypotheses={str(h.get("id")):h for h in world.get("hypotheses",[]) if h.get("id")}
         if hid not in hypotheses:
             return False,"hypothesis_not_observed"
-        if d.get("goal_id"):
-            goals={str(g.get("id")):g for g in world.get("candidate_goals",[]) if g.get("id")}
-            g=goals.get(str(d.get("goal_id")))
-            if g and str(g.get("source_hypothesis") or "") not in ("",hid):
-                return False,"goal_hypothesis_mismatch"
+        # NOTE: the goal<->hypothesis binding is intentionally NOT enforced as a
+        # hard reject. Requiring goal.source_hypothesis == hypothesis_id starved
+        # legitimate pivots (LDAP/RPC) whose goal was generated under a sibling
+        # hypothesis. Scope, evidence-basis and surface-observed checks above
+        # remain the real gates; goal coherence is left to ranking.
         return True,"grounded"
 
     def _plan(self,state):

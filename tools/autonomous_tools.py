@@ -53,7 +53,7 @@ def run_mcp_exploit(target: str, candidate: dict[str, Any]) -> str:
     })
 
 def run_post_exploit(target: str, access: dict[str, Any] | None = None) -> str:
-    return call_kali_mcp_tool("post_exploitation_enum", {
+    return call_kali_mcp_tool(os.getenv("MCP_POST_ENUM_TOOL", "post_exploitation_enum"), {
         "target": target,
         "access": access or {},
         "mode": "authorized_lab",
@@ -63,4 +63,20 @@ def verify_flags_remote(target: str) -> str:
     return call_kali_mcp_tool("verify_flags", {
         "target": target,
         "filenames": ["user.txt", "root.txt"],
+    })
+
+
+def run_session_manager(target: str, access: dict[str, Any] | None = None) -> str:
+    return call_kali_mcp_tool(os.getenv("MCP_SESSION_TOOL", "session_manager"), {
+        "target": target,
+        "access": access or {},
+        "mode": "authorized_lab",
+    })
+
+def run_privilege_escalation(target: str, access: dict[str, Any] | None = None) -> str:
+    return call_kali_mcp_tool(os.getenv("MCP_PRIVESC_TOOL", "privilege_escalation"), {
+        "target": target,
+        "access": access or {},
+        "objective": "root.txt",
+        "mode": "authorized_lab",
     })

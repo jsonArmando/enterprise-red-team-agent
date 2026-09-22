@@ -5,7 +5,7 @@ from core.failure_reasoner import FailureReasoner
 
 ALLOWED_ACTIONS = {
     "recon","vulnerability_scan","discover_kali_tools","cve_lookup",
-    "analyze_candidate","validate_candidate","exploit_candidate",
+    "analyze_candidate","validate_candidate","exploit_candidate","run_kali_tool",
     "establish_access","reverse_shell","session_enum","post_exploit_enum",
     "analyze_privesc","privilege_escalation","verify_flags","replan",
 }
@@ -58,8 +58,8 @@ class DecisionEngine:
             "Post-exploit enumeration must generate evidence before privilege escalation. "
             "Privilege escalation is a separate hypothesis/validation/execution stage. "
             "When an action fails, never repeat it without materially new evidence. "
-            "Mission completion is owned only by the flag verifier. Return JSON with "
-            "action,candidate_id,reason,priority."
+            "Mission completion is owned only by the flag verifier. For run_kali_tool also return "
+            "tool_name,arguments,timeout. Tool must come from the discovered Kali catalog."
         )
         try:
             r=httpx.post(

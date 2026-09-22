@@ -2,3 +2,13 @@ testing/
 __pycache__/
 *.log
 .env
+
+testing/
+__pycache__/
+*.log
+.env
+*.ovpn
+vpn/
+*.ccache
+*.pfx
+*.key

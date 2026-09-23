@@ -85,7 +85,7 @@ class ReasoningState:
             capabilities.append("smb_access")
         if re.search(r"\b(?:ldap|389/tcp|636/tcp|3268/tcp)\b", text):
             capabilities.append("ldap_visibility")
-        if re.search(r"\b(?:authenticated|authentication|credential|password|cpassword)\b", text):
+        if re.search(r"\b(?:authenticated|authentication|credential|password|cpassword)\b", text) or "valid_cred:" in text:
             capabilities.append("authenticated_identity")
         if re.search(r"\b(?:domain|active directory|objectclass=|sAMAccountName)\b", text):
             capabilities.append("directory_enumeration")

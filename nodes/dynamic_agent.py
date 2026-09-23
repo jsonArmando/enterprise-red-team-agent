@@ -68,7 +68,7 @@ class LLMDecisionEngine:
             "EXECUTION ENVIRONMENT. Strictly non-interactive: stdin is closed, so every command must pass explicit auth (e.g. -N/--no-pass for anonymous SMB, user:pass@host, -U 'user%pass') and never rely on a prompt. Use CORRECT tool syntax (e.g. ffuf uses -o/-of, gobuster uses -o, nmap uses -oN - do not mix them). The working directory is workspace.loot_dir; write outputs with RELATIVE filenames so they are persisted and auto-inspected. Multi-step chains (request a hash, then crack it) should save intermediate artifacts to files. Keep individual commands bounded in time; avoid unbounded scans.\n"
             "DOMAIN NOTES. For SMB retrieval do not guess remote paths: mirror the share with smbclient -c 'recurse ON; prompt OFF; mget *' or use an exact smb_file: path from the world model. A recovered credential appears in facts as 'valid_cred: <user>%<password>' (GPP cpasswords are decrypted for you - never hand-roll AES); reuse it directly in authenticated actions and for privilege escalation (Kerberoasting via GetUserSPNs, authenticated shares, remote shells).\n"
             "COMPLETION. mission_complete is true ONLY with explicit flag evidence (user.txt/root.txt content or a flag token). Vulnerability metadata is advisory only.")
-        payload={"model":self.model_name,"messages":[{"role":"system","content":prompt},{"role":"user","content":f"Target: {target}\\nWorld model:\\n{json.dumps(context,ensure_ascii=False,indent=2)}"}],"temperature":float(os.getenv("AGENT_LLM_TEMPERATURE","0.35"))}
+        payload={"model":self.model_name,"messages":[{"role":"system","content":prompt},{"role":"user","content":f"Target: {target}\\nWorld model:\\n{json.dumps(_fit_json(context),ensure_ascii=False,indent=2)}"}],"temperature":float(os.getenv("AGENT_LLM_TEMPERATURE","0.35"))}
         try:
             started=time.monotonic()
             content=_llm_post(self.base_url,self.api_key,payload)
@@ -125,6 +125,37 @@ def _llm_post(base_url, api_key, payload, timeout=90, retries=None):
     return ""
 
 
+def _fit_json(obj, max_chars=None):
+    """Shrink a context object so its serialized form fits a provider's request
+    budget (small-context models such as Groq's free tier return 413 otherwise).
+    Truncates long strings, then progressively caps every list to its most
+    recent N entries until it fits. AGENT_MAX_CONTEXT_CHARS overrides the budget."""
+    if max_chars is None:
+        max_chars=int(os.getenv("AGENT_MAX_CONTEXT_CHARS","12000"))
+    try:
+        s=json.dumps(obj,ensure_ascii=False)
+    except Exception:
+        return obj
+    if len(s)<=max_chars:
+        return obj
+    o=json.loads(s)  # deep copy via round-trip
+    def trunc(x):
+        if isinstance(x,str): return x[:280]
+        if isinstance(x,list): return [trunc(i) for i in x]
+        if isinstance(x,dict): return {k:trunc(v) for k,v in x.items()}
+        return x
+    o=trunc(o)
+    for cap in (60,40,25,15,10,6):
+        def capl(x):
+            if isinstance(x,list): return [capl(i) for i in x[-cap:]]
+            if isinstance(x,dict): return {k:capl(v) for k,v in x.items()}
+            return x
+        o2=capl(o)
+        if len(json.dumps(o2,ensure_ascii=False))<=max_chars:
+            return o2
+    return capl(o)
+
+
 def _extract_json(content):
     """Pull a JSON object out of an LLM response (handles code fences/prose)."""
     if isinstance(content,list):
@@ -178,7 +209,7 @@ class LLMHypothesisEngine:
             prompt += " Reference tactics (advisory, use only if the evidence fits):\n"+self.knowledge
         payload={"model":self.model_name,
                  "messages":[{"role":"system","content":prompt},
-                             {"role":"user","content":"Observed world model:\n"+json.dumps(world,ensure_ascii=False,indent=2)}],
+                             {"role":"user","content":"Observed world model:\n"+json.dumps(_fit_json(world),ensure_ascii=False,indent=2)}],
                  "temperature":float(os.getenv("AGENT_HYPOTHESIS_TEMPERATURE","0.4"))}
         try:
             data=_extract_json(_llm_post(self.base_url,self.api_key,payload))

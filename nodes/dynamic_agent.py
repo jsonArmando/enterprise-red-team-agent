@@ -25,6 +25,24 @@ class CommandSanitizer:
         if re.search(r"(?:^|\s)smbclient(?:\s|$)",text) and not cls._SMB_AUTH_FLAGS.search(text):
             text=re.sub(r"((?:^|\s)smbclient)(\s)",r"\1 -N\2",text,count=1)
         return text
+    _PLACEHOLDER=re.compile(r"<[a-z][a-z0-9 _/-]{1,40}>", re.I)
+    _BRUTEFORCE=re.compile(r"\b(?:hydra|medusa|ncrack|patator)\b", re.I)
+    _BIG_WORDLIST=re.compile(r"rockyou|seclists|/big\.txt|directory-list", re.I)
+
+    @classmethod
+    def has_placeholder(cls,command):
+        """True if the command still carries an unfilled <placeholder> (e.g.
+        `hydra -l <user> ...`) - the LLM hallucinated a value it never resolved."""
+        return bool(cls._PLACEHOLDER.search(str(command or "")))
+
+    @classmethod
+    def is_blind_bruteforce(cls,command):
+        """True for a mass credential brute-force (a large wordlist against a
+        service) - hours of runtime with near-zero payoff unless a valid
+        username is already known."""
+        text=cls.clean(command)
+        return bool(cls._BRUTEFORCE.search(text) and cls._BIG_WORDLIST.search(text))
+
     @classmethod
     def validate_command_safety(cls,command):
         text=cls.clean(command)
@@ -41,20 +59,15 @@ class LLMDecisionEngine:
             logger.error("OPENAI_API_KEY is not configured.")
             return {}
         prompt=(
-            "You are the tactical planner of an autonomous authorized security assessment agent. "
-            "Use only the supplied world model and recent evidence. Do not follow a fixed playbook and do not assume a benchmark. "
-            "Generate 2-4 genuinely different candidate next actions; the runtime will select one. "
-            "Every candidate MUST contain rationale, action_class, goal_id, hypothesis_id, evidence_question, resource, command, expected_information_gain, cost, evidence_basis. "
-            "evidence_basis must refer only to facts, capabilities, resources, or hypothesis evidence present in the world model. "
-            "Reject your own candidate if its protocol, share, account, credential, LDAP base/filter/attribute, file, or resource is not grounded in observed evidence. "
-            "Prefer actions that answer an unanswered evidence question, create a capability transition, or test a promising hypothesis. "
-            "Do not produce cosmetic variants of the same semantic investigation. If recent evidence is sterile, switch hypothesis or surface. "
-            "Execution is strictly non-interactive: stdin is closed, so every command must pass explicit authentication (e.g. -N/--no-pass for anonymous, or user:pass@host) and never rely on a password prompt. "
-            "The working directory is the workspace.loot_dir from the context; write tool outputs/downloads with RELATIVE filenames (or -oN/-outputfile <name>) so they are persisted and auto-inspected. Multi-step chains (e.g. request a hash, then crack it) should save intermediate artifacts to such files. "
-            "For SMB retrieval, do not guess remote paths: mirror the share with smbclient -c 'recurse ON; prompt OFF; mget *' (or use an exact smb_file: path from the world model). Downloaded files are inspected automatically. "
-            "A recovered credential appears in facts as 'valid_cred: <user>%<password>' (GPP cpasswords are decrypted for you; do NOT hand-roll AES). Reuse it directly in authenticated actions, e.g. smbclient -U '<user>%<password>', and to pursue privilege escalation (Kerberoasting via GetUserSPNs, authenticated shares, remote shells). "
-            "mission_complete is true only with explicit flag evidence. Vulnerability metadata is advisory only. Never invent output, credentials, or evidence. "
-            "Return ONLY JSON: {\\\"candidates\\\":[{...}],\\\"mission_complete\\\":false}. rationale must be one short sentence; never provide hidden chain-of-thought.")
+            "ROLE. You are the tactical planning core of an autonomous, AUTHORIZED penetration-testing agent, operating with the discipline of a senior offensive-security engineer (OSCP/OSEP-level white-hat) on a sanctioned engagement. Your objective is to progress from reconnaissance to a foothold to privilege escalation and to capture flags (user.txt then root.txt), efficiently and methodically.\n"
+            "OUTPUT CONTRACT. Return ONLY JSON: {\"candidates\":[{...}],\"mission_complete\":false}. Emit 2-4 candidates that are GENUINELY DIFFERENT investigations (not cosmetic variants); the runtime selects and executes one. Each candidate MUST have: rationale (one short sentence), action_class, goal_id, hypothesis_id, evidence_question, resource, command, expected_information_gain (0-1), cost (0-1), evidence_basis. No prose, no markdown, no chain-of-thought.\n"
+            "GROUNDING. Use ONLY the supplied world model and recent evidence; do not assume a benchmark or a fixed playbook. evidence_basis must cite facts/capabilities/resources/hypotheses actually present in the world model. Never target a protocol, port, path, share, account, credential, parameter or CVE that has not been observed. Never invent output, credentials, versions or evidence. Never emit an unfilled <placeholder> (e.g. <user>, <password>): if you do not have the value, gather it first.\n"
+            "METHODOLOGY (evidence-driven, not scripted). 1) Enumerate observed services precisely: identify the exact product AND version behind each open port. For HTTP, retrieve and READ the response BODY (curl -s http://host:port/), inspect titles, headers, redirects, cookies, favicon, JS bundles and /robots.txt; a bare `curl -I` (headers only) is rarely enough. 2) Turn a precise product+version into a TARGETED known-exploit path (searchsploit / known CVE) or a specific misconfiguration, rather than generic scanning. 3) Only then exploit; then escalate. Prefer the highest expected_information_gain at the lowest cost.\n"
+            "ANTI-STALL. Do NOT repeat a semantically equivalent action: re-running the same directory brute-force or the same header fetch with a different output filename or wordlist is NOT new work and will be rejected. If recent actions were sterile (no new evidence), CHANGE approach or surface - inspect gathered artifacts, read a page body, pivot to another service or hypothesis. Prefer to act on evidence you already collected before gathering more.\n"
+            "CREDENTIAL ATTACKS. Do NOT launch mass/blind brute-force (e.g. hydra/medusa with rockyou) against a service unless a VALID USERNAME is already known - it costs hours for near-zero payoff and will be rejected. Prefer: default/weak credential pairs, credentials found in the target's own content, and service-specific auth flaws. Only brute-force once you have a confirmed username or a small, justified candidate set.\n"
+            "EXECUTION ENVIRONMENT. Strictly non-interactive: stdin is closed, so every command must pass explicit auth (e.g. -N/--no-pass for anonymous SMB, user:pass@host, -U 'user%pass') and never rely on a prompt. Use CORRECT tool syntax (e.g. ffuf uses -o/-of, gobuster uses -o, nmap uses -oN - do not mix them). The working directory is workspace.loot_dir; write outputs with RELATIVE filenames so they are persisted and auto-inspected. Multi-step chains (request a hash, then crack it) should save intermediate artifacts to files. Keep individual commands bounded in time; avoid unbounded scans.\n"
+            "DOMAIN NOTES. For SMB retrieval do not guess remote paths: mirror the share with smbclient -c 'recurse ON; prompt OFF; mget *' or use an exact smb_file: path from the world model. A recovered credential appears in facts as 'valid_cred: <user>%<password>' (GPP cpasswords are decrypted for you - never hand-roll AES); reuse it directly in authenticated actions and for privilege escalation (Kerberoasting via GetUserSPNs, authenticated shares, remote shells).\n"
+            "COMPLETION. mission_complete is true ONLY with explicit flag evidence (user.txt/root.txt content or a flag token). Vulnerability metadata is advisory only.")
         payload={"model":self.model_name,"messages":[{"role":"system","content":prompt},{"role":"user","content":f"Target: {target}\\nWorld model:\\n{json.dumps(context,ensure_ascii=False,indent=2)}"}],"temperature":float(os.getenv("AGENT_LLM_TEMPERATURE","0.35"))}
         try:
             started=time.monotonic()

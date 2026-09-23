@@ -177,40 +177,65 @@ class ReasoningState:
         text = re.sub(r"\s+", " ", str(command or "").strip().lower())
         if not text:
             return "empty"
-        if any(x in text for x in ("decrypt", "decode", "decipher", "base64", "aes.new", "openssl enc")):
+        # Canonicalize away output sinks/wordlists so varying only the output
+        # filename (results.txt -> results_retry2.txt) does not create phantom
+        # distinct intents and defeat de-duplication / failed-intent suppression.
+        norm = re.sub(r"\s*\d?>\s*\S+", "", text)                       # shell redirection
+        norm = re.sub(r"\s-o(?:n|f|utput(?:file)?)?\s+\S+", "", norm)   # -o/-oN/-of/-outputfile FILE
+        norm = re.sub(r"\s--output(?:=|\s+)\S+", "", norm)
+        host = None
+        mh = re.search(r"https?://([a-z0-9_.:-]+)", norm) or re.search(r"//([a-z0-9_.:-]+)", norm)
+        if mh:
+            host = mh.group(1)
+        if any(x in norm for x in ("decrypt", "decode", "decipher", "base64", "aes.new", "openssl enc")):
             return "transform_credential_or_secret_material"
-        if any(x in text for x in ("cat ", "head ", "tail ", "less ", "more ", "jq ", "xmllint ", "grep ", "sed ")):
+        # Web enumeration/scanning: collapse by tool-class + host (ignore wordlist)
+        if any(t in norm for t in ("gobuster", "ffuf", "feroxbuster", "dirb", "dirbuster", "wfuzz")):
+            return f"web_content_enum:{host or 'target'}"
+        if "nikto" in norm:
+            return f"web_vuln_scan:{host or 'target'}"
+        if any(t in norm for t in ("whatweb", "wappalyzer")):
+            return f"web_fingerprint:{host or 'target'}"
+        if "searchsploit" in norm:
+            q = re.sub(r"searchsploit|\s-[a-z]+|\s", " ", norm)
+            q = re.sub(r"\s+", "_", q.strip())[:40]
+            return f"exploit_search:{q}"
+        if any(t in norm for t in ("hydra", "medusa", "ncrack", "patator")):
+            svc = "ssh" if "ssh" in norm else ("ftp" if "ftp" in norm else ("http" if "http" in norm else "svc"))
+            return f"bruteforce:{svc}:{host or 'target'}"
+        if re.search(r"\b(?:curl|wget)\b", norm):
+            head = bool(re.search(r"\s-i\b|--head", norm))
+            path = ""
+            mp = re.search(r"https?://[^/\s]+(/\S*)?", norm)
+            if mp and mp.group(1):
+                path = re.sub(r"[?#].*", "", mp.group(1))[:40]
+            return f"http_fetch:{'head' if head else 'body'}:{host or 'target'}{path}"
+        if any(x in norm for x in ("cat ", "head ", "tail ", "less ", "more ", "jq ", "xmllint ", "grep ", "sed ")):
             return "inspect_local_artifact"
-        if "smbclient" in text:
+        if "smbclient" in norm:
             resource = "server"
-            m = re.search(r"smbclient\s+[^ ]*//[^/\s]+/([^\s'\"]+)", text)
-            if not m:
-                m = re.search(r"//[^/\s]+/([^\s'\"]+)", text)
+            m = re.search(r"smbclient\s+[^ ]*//[^/\s]+/([^\s'\"]+)", norm) or re.search(r"//[^/\s]+/([^\s'\"]+)", norm)
             if m:
                 resource = re.sub(r"[^a-z0-9_.-]", "", m.group(1)) or "server"
-            # A get/mget is retrieval, not merely inspection of the SMB surface.
-            # Keep the resource scope so different shares remain distinct.
-            if re.search(r"\b(?:mget|get|reget)\b", text):
+            if re.search(r"\b(?:mget|get|reget)\b", norm):
                 return f"retrieve_remote_artifact:{resource}"
             return f"inspect_smb_resource:{resource}"
-        if any(x in text for x in ("get ", "mget ", "wget ", "curl ", "download")):
-            return "retrieve_remote_artifact"
-        if "ldapsearch" in text:
+        if "ldapsearch" in norm:
             base = "default"
-            m = re.search(r"\s-b\s+([^\s]+)", text)
+            m = re.search(r"\s-b\s+([^\s]+)", norm)
             if m:
                 base = re.sub(r"[^a-z0-9=,._-]", "", m.group(1))
-            scope = "base" if re.search(r"\s-s\s+base\b", text) else ("one" if re.search(r"\s-s\s+one\b", text) else "sub")
+            scope = "base" if re.search(r"\s-s\s+base\b", norm) else ("one" if re.search(r"\s-s\s+one\b", norm) else "sub")
             filt = "none"
-            m = re.search(r"\s(\([^)]{3,160}\))", text)
+            m = re.search(r"\s(\([^)]{3,160}\))", norm)
             if m:
                 filt = re.sub(r"\s+", "", m.group(1))
-            attrs = text.split()[-6:]
+            attrs = norm.split()[-6:]
             attr_key = ",".join(sorted(a for a in attrs if re.fullmatch(r"[a-z][a-z0-9-]{1,40}", a)))
             return f"enumerate_ldap:{base}:{scope}:{filt}:{attr_key}"
-        if any(x in text for x in ("rpcclient", "enum4linux", "smbmap")):
+        if any(x in norm for x in ("rpcclient", "enum4linux", "smbmap")):
             return "enumerate_remote_surface"
-        return text[:180]
+        return norm[:180]
 
     # smbclient recursive listing: a directory header line begins with a
     # backslash-rooted path; file entries follow, indented, with attribute

@@ -372,6 +372,19 @@ class EnterpriseDynamicAgent:
             if ReasoningState.action_intent(h.get("command",""))==intent: n+=1
         return n
 
+    @staticmethod
+    def _known_identity(context) -> bool:
+        """True if a concrete username/credential has been observed, which is
+        what justifies a large brute-force. Blind rockyou runs against an
+        unknown user are blocked otherwise (they burned hours for nothing)."""
+        world=context.get("world",{})
+        for f in world.get("facts",[]):
+            if str(f).startswith("valid_cred:"): return True
+        if "authenticated_identity" in {str(c).lower() for c in world.get("capabilities",[])}:
+            return True
+        ents=world.get("entities",{}) or {}
+        return bool(ents.get("identities"))
+
     def _plan(self,state):
         context=self._context(state)
         # Autonomy guard: if we have observed facts but no hypotheses yet
@@ -411,6 +424,10 @@ class EnterpriseDynamicAgent:
                 d["command"]=CommandSanitizer.clean(str(d.get("command") or ""))
                 if not d["command"] or not CommandSanitizer.validate_command_safety(d["command"]):
                     self._block(state,"candidate_execution_policy_rejected",d); continue
+                if CommandSanitizer.has_placeholder(d["command"]):
+                    self._block(state,"candidate_has_unfilled_placeholder",d); continue
+                if CommandSanitizer.is_blind_bruteforce(d["command"]) and not self._known_identity(context):
+                    self._block(state,"blind_bruteforce_without_known_user",d); continue
                 required=("action_class","evidence_question","hypothesis_id","evidence_basis")
                 if any(not str(d.get(k) or "").strip() for k in required):
                     self._block(state,"candidate_missing_reasoning_fields",d); continue
@@ -464,7 +481,20 @@ class EnterpriseDynamicAgent:
         for h in after.get("hypotheses",[]):
             if h.get("id") in oldh and isinstance(h.get("confidence"),(int,float)) and isinstance(oldh[h.get("id")],(int,float)): conf+=abs(float(h["confidence"])-float(oldh[h.get("id")]))
         delta={"fact_delta":len(newf-oldf),"capability_delta":len(newc-oldc),"hypothesis_confidence_delta":round(conf,4),"output_digest":self._digest(output) if output else ""}
-        progress=delta["fact_delta"]>0 or delta["capability_delta"]>0 or delta["hypothesis_confidence_delta"]>0.05
+        # Fix 1: real-progress accounting. Error-noise text was being counted as
+        # "new facts", so failed/sterile commands looked like progress and the
+        # no-progress budget never fired (10h runs). Now:
+        #  - a repeated output_digest is never progress (identical output again),
+        #  - a failed command (rc!=0) counts only on STRUCTURED gain (a new
+        #    capability or a real hypothesis-confidence shift), not raw fact text.
+        rc=r.get("returncode")
+        prior_digests={h.get("output_digest") for h in state.get("history",[]) if h.get("output_digest")}
+        digest_repeat=bool(delta["output_digest"]) and delta["output_digest"] in prior_digests
+        structured=delta["capability_delta"]>0 or delta["hypothesis_confidence_delta"]>0.05
+        if rc not in (0,None):
+            progress=structured and not digest_repeat
+        else:
+            progress=(delta["fact_delta"]>0 or structured) and not digest_repeat
         provisional.update({"evidence_delta":delta,"capability_delta":delta["capability_delta"],"no_new_evidence":not progress,"output_digest":delta["output_digest"]})
         logger.info("[=] Evidence | exec=%sms | rc=%s | facts+%s | capabilities+%s | hypothesis_delta=%s | progress=%s | digest=%s", execution_ms, r.get("returncode"), delta["fact_delta"], delta["capability_delta"], delta["hypothesis_confidence_delta"], progress, delta["output_digest"])
         return provisional

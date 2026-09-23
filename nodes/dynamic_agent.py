@@ -58,24 +58,37 @@ class LLMDecisionEngine:
         payload={"model":self.model_name,"messages":[{"role":"system","content":prompt},{"role":"user","content":f"Target: {target}\\nWorld model:\\n{json.dumps(context,ensure_ascii=False,indent=2)}"}],"temperature":float(os.getenv("AGENT_LLM_TEMPERATURE","0.35"))}
         try:
             started=time.monotonic()
-            with httpx.Client(timeout=90) as c:
-                r=c.post(f"{self.base_url}/chat/completions",json=payload,headers={"Authorization":f"Bearer {self.api_key}","Content-Type":"application/json"})
-            r.raise_for_status()
-            message=r.json()["choices"][0].get("message",{})
-            content=message.get("content","")
-            if isinstance(content,list):
-                content="".join(str(x.get("text","") if isinstance(x,dict) else x) for x in content)
-            content=str(content).strip()
-            content=re.sub(r"^```(?:json)?\s*|\s*```$","",content,flags=re.I|re.S).strip()
-            if not content.startswith("{"):
-                match=re.search(r"\{.*\}",content,re.S)
-                content=match.group(0) if match else content
-            data=json.loads(content)
-            if isinstance(data,dict):
+            content=_llm_post(self.base_url,self.api_key,payload)
+            data=_extract_json(content)
+            if isinstance(data,dict) and data:
                 data["_planner_latency_ms"]=round((time.monotonic()-started)*1000)
             return data if isinstance(data,dict) else {}
         except Exception as exc:
             logger.error("Planner failure: %s",exc); return {}
+
+
+def _llm_post(base_url, api_key, payload, timeout=90, retries=2):
+    """POST a chat-completion with backoff on transient failures (429/5xx and
+    connection errors). Returns the message content string. Non-transient
+    errors (e.g. 401/403 auth/quota) are raised immediately - retrying those
+    only wastes calls."""
+    last=None
+    for attempt in range(retries+1):
+        try:
+            with httpx.Client(timeout=timeout) as c:
+                r=c.post(f"{base_url}/chat/completions",json=payload,
+                         headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json"})
+            if r.status_code in (429,500,502,503,504):
+                last=httpx.HTTPStatusError(f"{r.status_code}",request=r.request,response=r)
+                time.sleep(2*(attempt+1)); continue
+            r.raise_for_status()
+            return r.json()["choices"][0].get("message",{}).get("content","")
+        except httpx.HTTPStatusError:
+            raise
+        except Exception as exc:
+            last=exc; time.sleep(2*(attempt+1))
+    if last: raise last
+    return ""
 
 
 def _extract_json(content):
@@ -87,11 +100,16 @@ def _extract_json(content):
     if not content.startswith("{"):
         m=re.search(r"\{.*\}",content,re.S)
         content=m.group(0) if m else content
-    try:
-        data=json.loads(content)
-        return data if isinstance(data,dict) else {}
-    except Exception:
-        return {}
+    # strict=False tolerates raw control chars (newlines/tabs) inside string
+    # values, which LLMs routinely emit inside command fields; retry with a
+    # sanitized copy if the model produced something still-malformed.
+    for candidate in (content, re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]"," ",content)):
+        try:
+            data=json.loads(candidate, strict=False)
+            return data if isinstance(data,dict) else {}
+        except Exception:
+            continue
+    return {}
 
 
 class LLMHypothesisEngine:
@@ -129,11 +147,7 @@ class LLMHypothesisEngine:
                              {"role":"user","content":"Observed world model:\n"+json.dumps(world,ensure_ascii=False,indent=2)}],
                  "temperature":float(os.getenv("AGENT_HYPOTHESIS_TEMPERATURE","0.4"))}
         try:
-            with httpx.Client(timeout=90) as c:
-                r=c.post(f"{self.base_url}/chat/completions",json=payload,
-                         headers={"Authorization":f"Bearer {self.api_key}","Content-Type":"application/json"})
-            r.raise_for_status()
-            data=_extract_json(r.json()["choices"][0].get("message",{}).get("content",""))
+            data=_extract_json(_llm_post(self.base_url,self.api_key,payload))
             hyps=data.get("hypotheses")
             return hyps if isinstance(hyps,list) else []
         except Exception as exc:

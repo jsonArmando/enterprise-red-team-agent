@@ -219,10 +219,12 @@ class EnterpriseDynamicAgent:
             brace=FLAG_BRACE.search(out)
             if brace:
                 found.append(f"stdout(step {h.get('step')})::{brace.group(0)}"); continue
-            if FLAG_FILE_REF.search(cmd):
+            ref=FLAG_FILE_REF.search(cmd)
+            if ref:
                 hexm=FLAG_HEX32.search(out)
                 if hexm:
-                    found.append(f"stdout(step {h.get('step')})::{hexm.group(0)}")
+                    # tag with the referenced flag filename so user/root can be told apart
+                    found.append(f"stdout {ref.group(0)} (step {h.get('step')})::{hexm.group(0)}")
         return found
 
     def flags_found(self, state: Optional[Dict[str, Any]]=None) -> List[str]:
@@ -453,34 +455,72 @@ class EnterpriseDynamicAgent:
         logger.info("[=] Evidence | exec=%sms | rc=%s | facts+%s | capabilities+%s | hypothesis_delta=%s | progress=%s | digest=%s", execution_ms, r.get("returncode"), delta["fact_delta"], delta["capability_delta"], delta["hypothesis_confidence_delta"], progress, delta["output_digest"])
         return provisional
 
-    def _complete_if_flag(self,state) -> bool:
+    @staticmethod
+    def _flag_kind(source: str) -> str:
+        low=str(source or "").lower()
+        if "root" in low or "proof" in low: return "root"
+        if "user" in low: return "user"
+        return "other"
+
+    def _record_foothold(self, state, user_flags) -> bool:
+        """Record a captured user flag without ending the mission, and steer the
+        agent toward privilege escalation. Returns True only the first time (so
+        it counts as progress and the planner then pivots to root)."""
+        reasoning=dict(state.get("reasoning") or {})
+        facts=list(reasoning.get("facts",[]))
+        marker=f"captured_user_flag: {user_flags[0]}"
+        if marker in facts:
+            return False
+        facts.append(marker)
+        facts.append("objective: user flag captured; escalate privileges to Administrator/root and read root.txt")
+        reasoning["facts"]=facts[-256:]
+        caps=list(reasoning.get("capabilities",[]))
+        if "needs_privilege_escalation" not in caps: caps.append("needs_privilege_escalation")
+        reasoning["capabilities"]=caps
+        entry={"event_type":"foothold","step":self.current_step,"output":marker,"returncode":0,
+               "no_new_evidence":False,"action_class":"record_foothold"}
+        self.state_manager.save_state(self.current_step,entry,phase="foothold",mission_complete=False,extra={"reasoning":reasoning})
+        logger.info("[+] User flag captured (foothold): %s -- continuing to privilege escalation.", user_flags[0])
+        return True
+
+    def _handle_flags(self, state) -> str:
+        """Return 'complete' (root/terminal flag -> stop), 'foothold' (only a
+        user flag, newly recorded -> keep going), or 'none'."""
         flags=self.flags_found(state)
-        if flags:
-            self.state_manager.mark_complete(f"flag_found:{flags[0]}",self.current_step)
-            logger.info("[+] Flag evidence detected: %s", flags[0])
-            return True
-        return False
+        if not flags: return "none"
+        terminal=[f for f in flags if self._flag_kind(f)!="user"]
+        if terminal:
+            self.state_manager.mark_complete(f"flag_found:{terminal[0]}",self.current_step)
+            logger.info("[+] ROOT/terminal flag detected -- mission complete: %s", terminal[0])
+            return "complete"
+        users=[f for f in flags if self._flag_kind(f)=="user"]
+        if users and self._record_foothold(state,users):
+            return "foothold"
+        return "none"
 
     def run_autonomous_loop(self):
         preflight_dependencies()
         while MAX_STEPS is None or self.current_step<=MAX_STEPS:
             state=self.state_manager.load_state()
             if state.get("mission_complete"): return
-            if self._complete_if_flag(state): return
+            status=self._handle_flags(state)
+            if status=="complete": return
+            if status=="foothold":
+                self.current_step+=1; continue  # pivot to privilege escalation
             if self._harvest_credentials(state):
                 self.current_step+=1; continue  # let the planner act on the new credential
             d=self._next_artifact(state) or self._initial() or self._plan(state)
             if d is None: logger.error("[!] No valid action; stopping safely."); self._block(state,"no_valid_action"); return
             if d.get("mission_complete"):
-                if self._complete_if_flag(state): return
+                if self._handle_flags(state)=="complete": return
             logger.info("[*] Paso %d/%s | %s | %s",self.current_step,MAX_STEPS or "∞",d.get("action_class","action"),d["command"])
             if not CommandSanitizer.validate_command_safety(d["command"]): self._block(state,"execution_policy_rejected",d); return
             entry=self._execute(state,d); ps=dict(state.get("planner_state") or {}); streak=int(ps.get("no_progress_streak",0)); streak=streak+1 if entry.get("no_new_evidence") else 0
             ps.update({"status":"NO_PROGRESS" if entry.get("no_new_evidence") else "PROGRESS","no_progress_streak":streak,"last_reason":"no_new_evidence" if entry.get("no_new_evidence") else "new_evidence"})
             reasoning=self.reasoning.update(entry.get("output",""),state.get("history",[])+[entry],entry.get("command", ""))
             self.state_manager.save_state(self.current_step,entry,phase=entry.get("action_class","autonomous"),mission_complete=False,extra={"planner_state":ps,"reasoning":reasoning,"last_action":{k:entry.get(k) for k in ("action_class","goal_id","hypothesis_id","evidence_question","resource")}})
-            # Declare victory in the same iteration the flag was read to stdout.
-            if self._complete_if_flag(self.state_manager.load_state()): return
+            # Root/terminal flag read to stdout this iteration ends the mission.
+            if self._handle_flags(self.state_manager.load_state())=="complete": return
             if streak>=MAX_NO_PROGRESS_STREAK: logger.error("[!] Progress budget exhausted; stopping safely."); return
             self.current_step+=1; time.sleep(1)
 

@@ -79,25 +79,93 @@ class ReasoningState:
             + [str(h.get("command", "")) for h in recent]
         ).lower()
         capabilities = []
-        if re.search(r"\b(?:445/tcp|139/tcp|microsoft-ds|netbios-ssn|smb|cifs)\b", text):
-            capabilities.append("smb_surface")
-        if re.search(r"\b(?:open|accessible|listing).{0,80}\b(?:smb|cifs|share)\b|\b(?:smb|cifs).{0,80}\b(?:accessible|anonymous|read)\b", text):
-            capabilities.append("smb_access")
-        if re.search(r"\b(?:ldap|389/tcp|636/tcp|3268/tcp)\b", text):
-            capabilities.append("ldap_visibility")
-        if re.search(r"\b(?:authenticated|authentication|credential|password|cpassword)\b", text) or "valid_cred:" in text:
+        # --- Generic service/surface map (any technology, not just AD) -------
+        surface_patterns = {
+            "web_surface": r"\b(?:80/tcp|443/tcp|8080/tcp|8000/tcp|8443/tcp|http|https|nginx|apache|iis|werkzeug|tomcat|php|http-title|http-server-header)\b",
+            "ssh_surface": r"\b(?:22/tcp|ssh|openssh)\b",
+            "ftp_surface": r"\b(?:21/tcp|ftp|vsftpd|proftpd|filezilla)\b",
+            "smb_surface": r"\b(?:445/tcp|139/tcp|microsoft-ds|netbios-ssn|smb|cifs)\b",
+            "ldap_visibility": r"\b(?:ldap|389/tcp|636/tcp|3268/tcp)\b",
+            "rpc_surface": r"\b(?:135/tcp|msrpc|rpcbind|111/tcp)\b",
+            "db_surface": r"\b(?:3306/tcp|5432/tcp|1433/tcp|1521/tcp|27017/tcp|mysql|mariadb|postgres|mssql|oracle|mongodb|redis|6379/tcp)\b",
+            "mail_surface": r"\b(?:25/tcp|110/tcp|143/tcp|smtp|imap|pop3)\b",
+            "dns_surface": r"\b(?:53/tcp|53/udp|domain\b|named|bind)\b",
+            "winrm_surface": r"\b(?:5985/tcp|5986/tcp|winrm|wsman)\b",
+            "kerberos_surface": r"\b(?:88/tcp|kerberos|krb5)\b",
+        }
+        for cap, pat in surface_patterns.items():
+            if re.search(pat, text):
+                capabilities.append(cap)
+        # --- Generic exploitation-relevant signals --------------------------
+        if re.search(r"\b(?:open|accessible|listing|read only|read/write|anonymous).{0,80}\b(?:smb|cifs|share|ftp)\b|\b(?:smb|cifs|ftp).{0,80}\b(?:accessible|anonymous|read)\b", text):
+            capabilities.append("anonymous_access")
+            if "smb_surface" in capabilities:  # alias kept for AD templates/grounding
+                capabilities.append("smb_access")
+        if "valid_cred:" in text or re.search(r"\b(?:authenticated|authentication|credential|password|cpassword|logon successful|login successful)\b", text):
             capabilities.append("authenticated_identity")
-        if re.search(r"\b(?:domain|active directory|objectclass=|sAMAccountName)\b", text):
+        if re.search(r"\b(?:objectclass=|sAMAccountName|active directory|domain controller)\b", text):
             capabilities.append("directory_enumeration")
-        if re.search(r"\b(?:spn|serviceprincipalname|kerberos|cifs/)\b", text):
+        if re.search(r"\b(?:spn|serviceprincipalname|kerberos|cifs/|krb5tgs)\b", text):
             capabilities.append("service_relationship_visibility")
-        if re.search(r"\b(?:shell|session|wmiexec|psexec|winrm|interactive)\b", text):
+        if re.search(r"/[a-z0-9_.-]+\.(?:php|asp|aspx|jsp|cgi)|index of /|directory listing|/admin|/login|\bupload\b|\bparameter\b|\?[a-z_]+=|/api/", text):
+            capabilities.append("web_content_discovered")
+        if re.search(r"\b(?:cve-\d{4}-\d+|vulnerable|exploit|outdated|end of life|deprecated)\b", text):
+            capabilities.append("known_vulnerability_signal")
+        if re.search(r"\b(?:shell|session|wmiexec|psexec|winrm|evil-winrm|interactive|meterpreter|reverse shell|uid=|whoami)\b", text):
             capabilities.append("remote_session")
-        if re.search(r"\b(?:administrator|system|root|privilege)\b", text):
+        if re.search(r"\b(?:administrator|nt authority|system|root|uid=0|sudo|privilege|seimpersonate|setuid)\b", text):
             capabilities.append("privilege_signal")
-        if re.search(r"\b(?:gpo|groups\.xml|sysvol|replication)\b", text):
+        if re.search(r"\b(?:gpo|groups\.xml|sysvol|replication|cpassword)\b", text):
             capabilities.append("policy_artifact_access")
         return cls._unique(capabilities, 32)
+
+    # Optional LLM hypothesis engine, wired once by the runtime. When present it
+    # supersedes the static AD templates so the agent generalizes to any target.
+    _hypothesis_engine = None
+
+    @classmethod
+    def set_hypothesis_engine(cls, engine):
+        cls._hypothesis_engine = engine
+
+    @classmethod
+    def _dynamic_hypotheses(cls, facts, capabilities, history, entities):
+        """Prefer LLM-generated hypotheses; fall back to static templates."""
+        engine = cls._hypothesis_engine
+        if engine is not None and getattr(engine, "available", lambda: False)():
+            world = {
+                "facts": [str(f) for f in facts[-80:]],
+                "capabilities": list(capabilities),
+                "entities": entities,
+                "recent_commands": [str(h.get("command", "")) for h in history[-8:] if h.get("event_type") == "action"],
+            }
+            try:
+                raw = engine.generate(world)
+            except Exception:
+                raw = []
+            hyps = []
+            for h in raw or []:
+                if not isinstance(h, dict) or not str(h.get("id") or "").strip():
+                    continue
+                hyps.append({
+                    "id": str(h.get("id")).strip()[:48],
+                    "statement": str(h.get("statement", ""))[:400],
+                    "tests": [str(t)[:60] for t in (h.get("tests") or []) if str(t).strip()][:8],
+                    "evidence": [],
+                    "confidence": round(cls._clamp(h.get("confidence", 0.5)), 3),
+                    "expected_information_gain": round(cls._clamp(h.get("expected_information_gain", 0.6)), 3),
+                    "cost": round(cls._clamp(h.get("cost", 0.3)), 3),
+                })
+            if hyps:
+                return hyps[:12]
+        # Fallback: static AD-oriented templates (offline / no API key).
+        return cls.generate_hypotheses(facts, capabilities, history)
+
+    @staticmethod
+    def _clamp(v, lo=0.0, hi=1.0):
+        try:
+            return max(lo, min(hi, float(v)))
+        except (TypeError, ValueError):
+            return 0.5
 
     @staticmethod
     def action_intent(command: str) -> str:
@@ -501,13 +569,15 @@ class ReasoningState:
         }
         for hypothesis in hypotheses:
             for test in hypothesis.get("tests", []):
-                goal = mapping.get(test)
+                # Known tests get a friendly goal id; unknown (LLM-proposed)
+                # tests are slugified so any surface produces actionable goals.
+                goal = mapping.get(test) or ("investigate_" + re.sub(r"[^a-z0-9]+", "_", str(test).lower()).strip("_"))[:60]
                 if goal and goal not in seen:
                     seen.add(goal)
                     goals.append({
                         "id": goal,
-                        "source_hypothesis": hypothesis["id"],
-                        "reason": hypothesis["statement"],
+                        "source_hypothesis": hypothesis.get("id"),
+                        "reason": hypothesis.get("statement", ""),
                         "status": "candidate",
                     })
         return goals[:16]
@@ -521,13 +591,21 @@ class ReasoningState:
         new_facts = self._unique(new_facts + smb_paths, 128)
         facts = self._unique(old_facts + new_facts, 256)
         capabilities = self.derive_capabilities(facts, history)
-        hypotheses = self.generate_hypotheses(facts, capabilities, history)
-        hypotheses = self.score_hypotheses(hypotheses, capabilities, history, self.old)
+        entities = self.extract_entities(output)
+        old_fact_set_pre = {x.lower() for x in old_facts}
+        has_new_evidence = any(x.lower() not in old_fact_set_pre for x in new_facts)
+        prior_hyps = list(self.old.get("hypotheses", []))
+        # Regenerate hypotheses only when evidence changed (bounds LLM cost);
+        # otherwise re-score the prior set so control/leases still update.
+        if has_new_evidence or not prior_hyps:
+            base_hyps = self._dynamic_hypotheses(facts, capabilities, history, entities)
+        else:
+            base_hyps = [{k: h.get(k) for k in ("id","statement","tests","evidence","confidence","expected_information_gain","cost")} for h in prior_hyps if h.get("id")]
+        hypotheses = self.score_hypotheses(base_hyps, capabilities, history, self.old)
         control = self.control_signal(hypotheses)
         hypothesis_control = self.build_hypothesis_control(hypotheses, control, self.old)
         goals = self.generate_goals(hypotheses, capabilities)
         vulnerability_signals = self.derive_vulnerability_signals(facts, capabilities, history)
-        entities = self.extract_entities(output)
         resources = self.derive_resources(history + [{"output": output, "command": history[-1].get("command", "") if history else "", "step": history[-1].get("step") if history else None}])
 
         old_fact_set = {x.lower() for x in old_facts}

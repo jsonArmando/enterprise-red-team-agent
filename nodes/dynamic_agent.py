@@ -76,3 +76,65 @@ class LLMDecisionEngine:
             return data if isinstance(data,dict) else {}
         except Exception as exc:
             logger.error("Planner failure: %s",exc); return {}
+
+
+def _extract_json(content):
+    """Pull a JSON object out of an LLM response (handles code fences/prose)."""
+    if isinstance(content,list):
+        content="".join(str(x.get("text","") if isinstance(x,dict) else x) for x in content)
+    content=str(content or "").strip()
+    content=re.sub(r"^```(?:json)?\s*|\s*```$","",content,flags=re.I|re.S).strip()
+    if not content.startswith("{"):
+        m=re.search(r"\{.*\}",content,re.S)
+        content=m.group(0) if m else content
+    try:
+        data=json.loads(content)
+        return data if isinstance(data,dict) else {}
+    except Exception:
+        return {}
+
+
+class LLMHypothesisEngine:
+    """Domain-agnostic hypothesis generator.
+
+    Replaces the hardcoded AD-only hypothesis templates: given observed
+    evidence it asks the model to propose attack-surface hypotheses for ANY
+    technology (web, Linux, Windows/AD, databases, network services). The
+    deterministic runtime still scores, leases and grounds them. Returns [] on
+    any failure so the caller can fall back to static templates offline.
+    """
+    def __init__(self, knowledge: str = ""):
+        self.api_key=os.environ.get("OPENAI_API_KEY","").strip()
+        self.base_url=os.environ.get("OPENAI_API_BASE","https://api.x.ai/v1").strip()
+        self.model_name=os.environ.get("MODEL_NAME","grok-3").strip()
+        self.knowledge=(knowledge or "")[:6000]
+
+    def available(self) -> bool:
+        return bool(self.api_key)
+
+    def generate(self, world):
+        if not self.api_key:
+            return []
+        prompt=(
+            "You are the reasoning module of an autonomous authorized penetration-testing agent. "
+            "From the OBSERVED evidence only, propose 3-8 hypotheses about exploitable attack surfaces or the next investigations worth pursuing. "
+            "Cover ANY technology as the evidence warrants - web apps, Linux services and privilege escalation, Windows/Active Directory, databases, network services - do NOT assume a benchmark or a fixed methodology. "
+            "Each hypothesis MUST be an object with: id (short stable slug, e.g. H-WEB-LFI, H-SMB-ANON, H-SSH-CREDS), statement (one sentence), tests (list of short evidence categories a next action would gather), confidence (0-1), expected_information_gain (0-1), cost (0-1). "
+            "Ground every hypothesis in the supplied facts/capabilities/services; do not invent services that were not observed. Prefer high information gain at low cost. "
+            "Return ONLY JSON: {\"hypotheses\":[{...}]}. No prose, no chain-of-thought.")
+        if self.knowledge:
+            prompt += " Reference tactics (advisory, use only if the evidence fits):\n"+self.knowledge
+        payload={"model":self.model_name,
+                 "messages":[{"role":"system","content":prompt},
+                             {"role":"user","content":"Observed world model:\n"+json.dumps(world,ensure_ascii=False,indent=2)}],
+                 "temperature":float(os.getenv("AGENT_HYPOTHESIS_TEMPERATURE","0.4"))}
+        try:
+            with httpx.Client(timeout=90) as c:
+                r=c.post(f"{self.base_url}/chat/completions",json=payload,
+                         headers={"Authorization":f"Bearer {self.api_key}","Content-Type":"application/json"})
+            r.raise_for_status()
+            data=_extract_json(r.json()["choices"][0].get("message",{}).get("content",""))
+            hyps=data.get("hypotheses")
+            return hyps if isinstance(hyps,list) else []
+        except Exception as exc:
+            logger.error("Hypothesis engine failure: %s",exc); return []

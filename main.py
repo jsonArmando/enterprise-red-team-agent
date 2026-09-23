@@ -7,7 +7,7 @@ from core.world_model import WorldModel
 from core.state_manager import StateManager
 from core.policy_engine import evaluate_policy
 from utils.smart_executor import SmartCommandExecutor
-from nodes.dynamic_agent import CommandSanitizer, LLMDecisionEngine
+from nodes.dynamic_agent import CommandSanitizer, LLMDecisionEngine, LLMHypothesisEngine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", handlers=[logging.StreamHandler(sys.stdout)])
 logger=logging.getLogger("EnterpriseDynamicAgent")
@@ -35,6 +35,21 @@ OPTIONAL_TOOLS=("nxc","netexec","crackmapexec","rpcclient","enum4linux","kerbrut
                 "gpp-decrypt","hashcat","john","impacket-GetUserSPNs","GetUserSPNs.py",
                 "impacket-wmiexec","wmiexec.py","evil-winrm")
 DEFAULT_WORDLIST=os.getenv("AGENT_WORDLIST","/usr/share/wordlists/rockyou.txt")
+
+
+def _load_knowledge_base() -> str:
+    """Concatenate knowledge_base/*.md as advisory tactics for the hypothesis
+    engine (RAG-lite). Missing directory is fine."""
+    kb = Path(__file__).resolve().parent / "knowledge_base"
+    if not kb.is_dir():
+        return ""
+    chunks = []
+    for p in sorted(kb.glob("*.md")):
+        try:
+            chunks.append(p.read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            continue
+    return "\n\n".join(chunks)
 
 
 def preflight_dependencies() -> Dict[str, List[str]]:
@@ -113,7 +128,11 @@ class EnterpriseDynamicAgent:
         self.loot_dir.mkdir(parents=True,exist_ok=True); self.scans_dir.mkdir(parents=True,exist_ok=True)
         state=self.state_manager.load_state(); self.current_step=int(state.get("step_count",0))+1
         self.executor=SmartCommandExecutor(timeout_minutes=int(os.getenv("AGENT_COMMAND_TIMEOUT_MINUTES","20")),poll_interval=int(os.getenv("AGENT_POLL_INTERVAL","15")))
-        self.planner=LLMDecisionEngine(); self.reasoning=ReasoningState(state)
+        self.planner=LLMDecisionEngine()
+        # Domain-agnostic reasoning: the LLM proposes hypotheses for ANY target
+        # type; static AD templates remain only as an offline fallback.
+        ReasoningState.set_hypothesis_engine(LLMHypothesisEngine(knowledge=_load_knowledge_base()))
+        self.reasoning=ReasoningState(state)
 
     @staticmethod
     def _digest(value): return hashlib.sha256(value.encode("utf-8",errors="ignore")).hexdigest()[:16]

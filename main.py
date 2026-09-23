@@ -374,6 +374,20 @@ class EnterpriseDynamicAgent:
 
     def _plan(self,state):
         context=self._context(state)
+        # Autonomy guard: if we have observed facts but no hypotheses yet
+        # (stale state, or the engine was unavailable when evidence arrived),
+        # regenerate hypotheses from current facts before grounding candidates,
+        # so planning is never dead-locked by an empty hypothesis set.
+        if not context["world"].get("hypotheses") and context["world"].get("facts"):
+            try:
+                refreshed=ReasoningState(state).update("", state.get("history",[]), "")
+                if refreshed.get("hypotheses"):
+                    merged=dict(state); merged["reasoning"]=refreshed
+                    self.state_manager.save_state(self.current_step,{"event_type":"reasoning_refresh","step":self.current_step,"output":"","returncode":0,"no_new_evidence":True,"action_class":"reasoning_refresh"},phase="reasoning_refresh",mission_complete=False,extra={"reasoning":refreshed})
+                    state=self.state_manager.load_state(); context=self._context(state)
+                    logger.info("[~] Regenerated %d hypotheses from existing evidence.", len(refreshed.get("hypotheses",[])))
+            except Exception as exc:
+                logger.warning("[~] Hypothesis refresh failed: %s", exc)
         for _ in range(MAX_PLANNER_RETRIES):
             raw=self.planner.plan(self.target,context)
             if not isinstance(raw,dict):

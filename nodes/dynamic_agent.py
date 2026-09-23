@@ -80,11 +80,24 @@ class LLMDecisionEngine:
             logger.error("Planner failure: %s",exc); return {}
 
 
-def _llm_post(base_url, api_key, payload, timeout=90, retries=2):
+_LLM_LAST_CALL=[0.0]  # module-level pacing clock for a simple client-side throttle
+
+def _llm_post(base_url, api_key, payload, timeout=90, retries=None):
     """POST a chat-completion with backoff on transient failures (429/5xx and
     connection errors). Returns the message content string. Non-transient
     errors (e.g. 401/403 auth/quota) are raised immediately - retrying those
-    only wastes calls."""
+    only wastes calls.
+
+    AGENT_LLM_MIN_INTERVAL (seconds) enforces a minimum gap between calls to
+    stay under provider rate limits; AGENT_LLM_MAX_RETRIES sets retry count."""
+    if retries is None:
+        retries=int(os.getenv("AGENT_LLM_MAX_RETRIES","4"))
+    min_interval=float(os.getenv("AGENT_LLM_MIN_INTERVAL","0") or 0)
+    if min_interval>0:
+        gap=time.monotonic()-_LLM_LAST_CALL[0]
+        if gap<min_interval:
+            time.sleep(min_interval-gap)
+    _LLM_LAST_CALL[0]=time.monotonic()
     last=None
     for attempt in range(retries+1):
         try:
@@ -93,7 +106,15 @@ def _llm_post(base_url, api_key, payload, timeout=90, retries=2):
                          headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json"})
             if r.status_code in (429,500,502,503,504):
                 last=httpx.HTTPStatusError(f"{r.status_code}",request=r.request,response=r)
-                time.sleep(2*(attempt+1)); continue
+                # Honor Retry-After when the server sends it (429 rate limits do);
+                # otherwise exponential backoff. 429 waits longer than 5xx.
+                ra=r.headers.get("retry-after")
+                try: wait=float(ra) if ra else None
+                except ValueError: wait=None
+                if wait is None:
+                    wait=min(30.0,(5.0 if r.status_code==429 else 2.0)*(2**attempt))
+                logger.warning("[llm] %s from API; backing off %.1fs (attempt %d/%d)", r.status_code, wait, attempt+1, retries+1)
+                time.sleep(wait); continue
             r.raise_for_status()
             return r.json()["choices"][0].get("message",{}).get("content","")
         except httpx.HTTPStatusError:
